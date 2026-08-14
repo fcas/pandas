@@ -12,8 +12,9 @@ module is imported, register them here rather than in the module.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
-from typing import Callable
+from typing import Any
 
 import pandas._config.config as cf
 from pandas._config.config import (
@@ -26,6 +27,8 @@ from pandas._config.config import (
     is_str,
     is_text,
 )
+
+from pandas.errors import Pandas4Warning
 
 # compute
 
@@ -40,7 +43,7 @@ use_bottleneck_doc = """
 def use_bottleneck_cb(key: str) -> None:
     from pandas.core import nanops
 
-    nanops.set_use_bottleneck(cf.get_option(key))
+    nanops.set_use_bottleneck(cf._global_config["compute"]["use_bottleneck"])
 
 
 use_numexpr_doc = """
@@ -54,7 +57,7 @@ use_numexpr_doc = """
 def use_numexpr_cb(key: str) -> None:
     from pandas.core.computation import expressions
 
-    expressions.set_use_numexpr(cf.get_option(key))
+    expressions.set_use_numexpr(cf._global_config["compute"]["use_numexpr"])
 
 
 use_numba_doc = """
@@ -68,7 +71,7 @@ use_numba_doc = """
 def use_numba_cb(key: str) -> None:
     from pandas.core.util import numba_
 
-    numba_.set_use_numba(cf.get_option(key))
+    numba_.set_use_numba(cf._global_config["compute"]["use_numba"])
 
 
 with cf.config_prefix("compute"):
@@ -99,7 +102,10 @@ pc_max_rows_doc = """
 : int
     If max_rows is exceeded, switch to truncate view. Depending on
     `large_repr`, objects are either centrally truncated or printed as
-    a summary view. 'None' value means unlimited.
+    a summary view.
+
+    'None' value means unlimited. Beware that printing a large number of rows
+    could cause your rendering environment (the browser, etc.) to crash.
 
     In case python/IPython is running in a terminal and `large_repr`
     equals 'truncate' this can be set to 0 and pandas will auto-detect
@@ -120,7 +126,11 @@ pc_max_cols_doc = """
 : int
     If max_cols is exceeded, switch to truncate view. Depending on
     `large_repr`, objects are either centrally truncated or printed as
-    a summary view. 'None' value means unlimited.
+    a summary view.
+
+    'None' value means unlimited. Beware that printing a large number of
+    columns could cause your rendering environment (the browser, etc.) to
+    crash.
 
     In case python/IPython is running in a terminal and `large_repr`
     equals 'truncate' this can be set to 0 or None and pandas will auto-detect
@@ -248,7 +258,7 @@ pc_chop_threshold_doc = """
 
 pc_max_seq_items = """
 : int or None
-    When pretty-printing a long sequence, no more then `max_seq_items`
+    When pretty-printing a long sequence, no more than `max_seq_items`
     will be printed. If items are omitted, they will be denoted by the
     addition of "..." to the resulting string.
 
@@ -280,7 +290,7 @@ pc_memory_usage_doc = """
 def table_schema_cb(key: str) -> None:
     from pandas.io.formats.printing import enable_data_resource_formatter
 
-    enable_data_resource_formatter(cf.get_option(key))
+    enable_data_resource_formatter(cf._global_config["display"]["html"]["table_schema"])
 
 
 def is_terminal() -> bool:
@@ -398,12 +408,11 @@ with cf.config_prefix("mode"):
     cf.register_option("sim_interactive", False, tc_sim_interactive_doc)
 
 
-# TODO better name?
 copy_on_write_doc = """
 : bool
-    Use new copy-view behaviour using Copy-on-Write. Defaults to False,
-    unless overridden by the 'PANDAS_COPY_ON_WRITE' environment variable
-    (if set to "1" for True, needs to be set before pandas is imported).
+    Use new copy-view behaviour using Copy-on-Write. No longer used,
+    pandas now always uses Copy-on-Write behavior. This option will
+    be removed in pandas 4.0.
 """
 
 
@@ -414,7 +423,7 @@ with cf.config_prefix("mode"):
         # to False. This environment variable can be set for testing.
         "warn"
         if os.environ.get("PANDAS_COPY_ON_WRITE", "0") == "warn"
-        else os.environ.get("PANDAS_COPY_ON_WRITE", "0") == "1",
+        else os.environ.get("PANDAS_COPY_ON_WRITE", "1") == "1",
         copy_on_write_doc,
         validator=is_one_of_factory([True, False, "warn"]),
     )
@@ -449,18 +458,55 @@ with cf.config_prefix("mode"):
     )
 
 
+max_threads_doc = """
+: int or None
+    Maximum number of worker threads for parallel operations (e.g. ``read_csv``
+    for large files).  ``None`` (the default) means use ``min(os.cpu_count(), 4)``,
+    further limited to the CPUs available to the process (CPU affinity and cgroup
+    limits); on Windows the default is ``1``, as parallel reading is not faster
+    there.  Set to ``1`` to disable parallel execution, or to a fixed number to
+    raise the cap or to limit thread usage when pandas is embedded in a larger
+    parallel workflow.  Ignored on Emscripten/Pyodide, which cannot spawn threads.
+"""
+
+
+def _is_positive_int_or_none(value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, int) and value >= 1:
+        return
+    raise ValueError("Value must be a positive integer or None")
+
+
+with cf.config_prefix("mode"):
+    cf.register_option(
+        "max_threads",
+        None,
+        max_threads_doc,
+        validator=_is_positive_int_or_none,
+    )
+
+
 string_storage_doc = """
 : string
-    The default storage for StringDtype. This option is ignored if
-    ``future.infer_string`` is set to True.
+    The default storage for StringDtype.
 """
+
+
+def is_valid_string_storage(value: Any) -> None:
+    legal_values = ["auto", "python", "pyarrow"]
+    if value not in legal_values:
+        msg = "Value must be one of python|pyarrow"
+        raise ValueError(msg)
+
 
 with cf.config_prefix("mode"):
     cf.register_option(
         "string_storage",
-        "python",
+        "auto",
         string_storage_doc,
-        validator=is_one_of_factory(["python", "pyarrow", "pyarrow_numpy"]),
+        # validator=is_one_of_factory(["python", "pyarrow"]),
+        validator=is_valid_string_storage,
     )
 
 
@@ -483,7 +529,7 @@ with cf.config_prefix("io.excel.xls"):
         "reader",
         "auto",
         reader_engine_doc.format(ext="xls", others=", ".join(_xls_options)),
-        validator=is_one_of_factory(_xls_options + ["auto"]),
+        validator=is_one_of_factory([*_xls_options, "auto"]),
     )
 
 with cf.config_prefix("io.excel.xlsm"):
@@ -491,7 +537,7 @@ with cf.config_prefix("io.excel.xlsm"):
         "reader",
         "auto",
         reader_engine_doc.format(ext="xlsm", others=", ".join(_xlsm_options)),
-        validator=is_one_of_factory(_xlsm_options + ["auto"]),
+        validator=is_one_of_factory([*_xlsm_options, "auto"]),
     )
 
 
@@ -500,7 +546,7 @@ with cf.config_prefix("io.excel.xlsx"):
         "reader",
         "auto",
         reader_engine_doc.format(ext="xlsx", others=", ".join(_xlsx_options)),
-        validator=is_one_of_factory(_xlsx_options + ["auto"]),
+        validator=is_one_of_factory([*_xlsx_options, "auto"]),
     )
 
 
@@ -509,7 +555,7 @@ with cf.config_prefix("io.excel.ods"):
         "reader",
         "auto",
         reader_engine_doc.format(ext="ods", others=", ".join(_ods_options)),
-        validator=is_one_of_factory(_ods_options + ["auto"]),
+        validator=is_one_of_factory([*_ods_options, "auto"]),
     )
 
 with cf.config_prefix("io.excel.xlsb"):
@@ -517,7 +563,7 @@ with cf.config_prefix("io.excel.xlsb"):
         "reader",
         "auto",
         reader_engine_doc.format(ext="xlsb", others=", ".join(_xlsb_options)),
-        validator=is_one_of_factory(_xlsb_options + ["auto"]),
+        validator=is_one_of_factory([*_xlsb_options, "auto"]),
     )
 
 # Set up the io.excel specific writer configuration.
@@ -634,7 +680,7 @@ def register_converter_cb(key: str) -> None:
         register_matplotlib_converters,
     )
 
-    if cf.get_option(key):
+    if cf._global_config["plotting"]["matplotlib"]["register_converters"]:
         register_matplotlib_converters()
     else:
         deregister_matplotlib_converters()
@@ -691,26 +737,41 @@ styler_max_columns = """
 styler_precision = """
 : int
     The precision for floats and complex numbers.
+    This option affects only ``Styler`` rendering (e.g. ``DataFrame.style``), not
+    the default Series/DataFrame repr, which is controlled by the ``display.*``
+    options.
 """
 
 styler_decimal = """
 : str
     The character representation for the decimal separator for floats and complex.
+    This option affects only ``Styler`` rendering (e.g. ``DataFrame.style``), not
+    the default Series/DataFrame repr, which is controlled by the ``display.*``
+    options.
 """
 
 styler_thousands = """
 : str, optional
     The character representation for thousands separator for floats, int and complex.
+    This option affects only ``Styler`` rendering (e.g. ``DataFrame.style``), not
+    the default Series/DataFrame repr, which is controlled by the ``display.*``
+    options.
 """
 
 styler_na_rep = """
 : str, optional
     The string representation for values identified as missing.
+    This option affects only ``Styler`` rendering (e.g. ``DataFrame.style``), not
+    the default Series/DataFrame repr, which is controlled by the ``display.*``
+    options.
 """
 
 styler_escape = """
 : str, optional
     Whether to escape certain characters according to the given context; html or latex.
+    This option affects only ``Styler`` rendering (e.g. ``DataFrame.style``), not
+    the default Series/DataFrame repr, which is controlled by the ``display.*``
+    options.
 """
 
 styler_formatter = """
@@ -858,7 +919,7 @@ with cf.config_prefix("styler"):
 with cf.config_prefix("future"):
     cf.register_option(
         "infer_string",
-        False,
+        False if os.environ.get("PANDAS_FUTURE_INFER_STRING", "1") == "0" else True,
         "Whether to infer sequence of str objects as pyarrow string "
         "dtype, which will be the default in pandas 3.0 "
         "(at which point this option will be deprecated).",
@@ -868,10 +929,51 @@ with cf.config_prefix("future"):
     cf.register_option(
         "no_silent_downcasting",
         False,
-        "Whether to opt-in to the future behavior which will *not* silently "
-        "downcast results from Series and DataFrame `where`, `mask`, and `clip` "
-        "methods. "
-        "Silent downcasting will be removed in pandas 3.0 "
-        "(at which point this option will be deprecated).",
+        "This option is deprecated and will be removed in a future version. "
+        "It has no effect.",
         validator=is_one_of_factory([True, False]),
     )
+
+    cf.register_option(
+        "distinguish_nan_and_na",
+        os.environ.get("PANDAS_FUTURE_DISTINGUISH_NAN_AND_NA", "0") == "1",
+        "Whether to treat NaN entries as distinct from pd.NA in "
+        "numpy-nullable and pyarrow float dtypes. By default treats both "
+        "interchangeable as missing values (NaN will be coerced to NA). "
+        "See discussion in "
+        "https://github.com/pandas-dev/pandas/issues/32265",
+        validator=is_one_of_factory([True, False]),
+    )
+
+    cf.register_option(
+        "python_scalars",
+        False if os.environ.get("PANDAS_FUTURE_PYTHON_SCALARS", "0") == "0" else True,
+        "Whether to return Python scalars instead of NumPy or PyArrow scalars. "
+        "Values from object dtype data where the operation coerces them to NumPy "
+        "floats remain NumPy scalars. "
+        "Currently experimental, setting to True is not recommended for end users.",
+        validator=is_one_of_factory([True, False]),
+    )
+
+    cf.register_option(
+        "infer_freq_returns_offset",
+        None,
+        "Whether pd.infer_freq and .inferred_freq return a BaseOffset object "
+        "instead of a string, which will be the default in a future version of "
+        "pandas. Set to True to opt in to the future behavior, or False to "
+        "keep the old behavior and silence the warning.",
+        validator=is_one_of_factory([True, False, None]),
+    )
+
+
+# GH#59502
+cf.deprecate_option("future.no_silent_downcasting", Pandas4Warning)
+cf.deprecate_option(
+    "mode.copy_on_write",
+    Pandas4Warning,
+    msg=(
+        "The 'mode.copy_on_write' option is deprecated. Copy-on-Write can no longer "
+        "be disabled (it is always enabled with pandas >= 3.0), and setting the option "
+        "has no impact. This option will be removed in pandas 4.0."
+    ),
+)

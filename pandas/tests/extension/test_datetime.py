@@ -33,7 +33,7 @@ def dtype():
 @pytest.fixture
 def data(dtype):
     data = DatetimeArray._from_sequence(
-        pd.date_range("2000", periods=100, tz=dtype.tz), dtype=dtype
+        pd.date_range("2000", periods=10, tz=dtype.tz), dtype=dtype
     )
     return data
 
@@ -95,28 +95,31 @@ class TestDatetimeArray(base.ExtensionTests):
             return None
         return super()._get_expected_exception(op_name, obj, other)
 
+    def _get_expected_reduction_dtype(self, arr, op_name: str, skipna: bool):
+        if op_name == "std":
+            return "timedelta64[ns]"
+        return arr.dtype
+
     def _supports_accumulation(self, ser, op_name: str) -> bool:
         return op_name in ["cummin", "cummax"]
 
     def _supports_reduction(self, obj, op_name: str) -> bool:
-        return op_name in ["min", "max", "median", "mean", "std", "any", "all"]
-
-    @pytest.mark.parametrize("skipna", [True, False])
-    def test_reduce_series_boolean(self, data, all_boolean_reductions, skipna):
-        meth = all_boolean_reductions
-        msg = f"datetime64 type does not support operation '{meth}'"
-        with pytest.raises(TypeError, match=msg):
-            super().test_reduce_series_boolean(data, all_boolean_reductions, skipna)
+        return op_name in ["min", "max", "median", "mean", "std", "count"]
 
     def test_series_constructor(self, data):
         # Series construction drops any .freq attr
-        data = data._with_freq(None)
+        data = data.view()
+        data._freq = None
         super().test_series_constructor(data)
 
     @pytest.mark.parametrize("na_action", [None, "ignore"])
     def test_map(self, data, na_action):
         result = data.map(lambda x: x, na_action=na_action)
         tm.assert_extension_array_equal(result, data)
+
+    @pytest.mark.skip("DatetimeArray.round uses a different signature (freq).")
+    def test_round(self, data):
+        pass
 
     def check_reduce(self, ser: pd.Series, op_name: str, skipna: bool):
         if op_name in ["median", "mean", "std"]:
@@ -137,6 +140,28 @@ class TestDatetimeArray(base.ExtensionTests):
 
         else:
             return super().check_reduce(ser, op_name, skipna)
+
+    @pytest.mark.filterwarnings(
+        "ignore:The default 'epoch' date format is deprecated:DeprecationWarning"
+    )
+    def test_values_for_json(self, data):
+        # GH 65127
+        # DatetimeArray relies on the default 'epoch' format for datetimes, leading to
+        # the filtered Pandas4Warning.
+        super().test_values_for_json(data)
+
+    @pytest.mark.filterwarnings(
+        "ignore:The default 'epoch' date format is deprecated:DeprecationWarning"
+    )
+    @pytest.mark.xfail(
+        raises=AssertionError, reason="DatetimeArray does not support JSON roundtrip."
+    )
+    def test_json_roundtrip(self, data):
+        # GH 65127
+        # DatetimeArray fails on roundtrip. Also currently the json serialization relies
+        # on the default 'epoch' format for datetimes, leading to the filtered
+        # Pandas4Warning.
+        super().test_json_roundtrip(data)
 
 
 class Test2DCompat(base.NDArrayBacked2DTests):

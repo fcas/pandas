@@ -13,6 +13,7 @@ from pandas.core.dtypes.common import (
     is_integer,
     is_list_like,
 )
+from pandas.core.dtypes.dtypes import DatetimeTZDtype
 from pandas.core.dtypes.generic import (
     ABCDataFrame,
     ABCIndex,
@@ -95,11 +96,12 @@ class HistPlot(LinePlot):
     def _calculate_bins(self, data: Series | DataFrame, bins) -> np.ndarray:
         """Calculate bins given data"""
         nd_values = data.infer_objects()._get_numeric_data()
-        values = np.ravel(nd_values)
+        values = nd_values.values
+        if nd_values.ndim == 2:
+            values = values.reshape(-1)
         values = values[~isna(values)]
 
-        hist, bins = np.histogram(values, bins=bins, range=self._bin_range)
-        return bins
+        return np.histogram_bin_edges(values, bins=bins, range=self._bin_range)
 
     # error: Signature of "_plot" incompatible with supertype "LinePlot"
     @classmethod
@@ -136,10 +138,7 @@ class HistPlot(LinePlot):
             if self.by is not None
             else self.data
         )
-
-        # error: Argument "data" to "_iter_data" of "MPLPlot" has incompatible
-        # type "object"; expected "DataFrame | dict[Hashable, Series | DataFrame]"
-        for i, (label, y) in enumerate(self._iter_data(data=data)):  # type: ignore[arg-type]
+        for i, (label, y) in enumerate(self._iter_data(data=data)):
             ax = self._get_ax(i)
 
             kwds = self.kwds.copy()
@@ -262,12 +261,13 @@ class KdePlot(HistPlot):
 
     @classmethod
     # error: Signature of "_plot" incompatible with supertype "MPLPlot"
-    def _plot(  #  type: ignore[override]
+    def _plot(  # type: ignore[override]
         cls,
         ax: Axes,
         y: np.ndarray,
         style=None,
         bw_method=None,
+        weights=None,
         ind=None,
         column_num=None,
         stacking_id: int | None = None,
@@ -275,9 +275,11 @@ class KdePlot(HistPlot):
     ):
         from scipy.stats import gaussian_kde
 
-        y = remove_na_arraylike(y)
-        gkde = gaussian_kde(y, bw_method=bw_method)
+        y = remove_na_arraylike(y)  # pyright: ignore[reportAssignmentType]
+        gkde = gaussian_kde(y, bw_method=bw_method, weights=weights)
 
+        # gaussian_kde.evaluate(None) raises TypeError, so pyright requires this check
+        assert ind is not None
         y = gkde.evaluate(ind)
         lines = MPLPlot._plot(ax, ind, y, style=style, **kwds)
         return lines
@@ -322,10 +324,7 @@ def _grouped_plot(
         naxes=naxes, figsize=figsize, sharex=sharex, sharey=sharey, ax=ax, layout=layout
     )
 
-    _axes = flatten_axes(axes)
-
-    for i, (key, group) in enumerate(grouped):
-        ax = _axes[i]
+    for ax, (key, group) in zip(flatten_axes(axes), grouped, strict=False):
         if numeric_only and isinstance(group, ABCDataFrame):
             group = group._get_numeric_data()
         plotf(group, ax, **kwargs)
@@ -386,7 +385,7 @@ def _grouped_hist(
             kwargs["label"] = column
 
     def plot_group(group, ax) -> None:
-        ax.hist(group.dropna().values, bins=bins, **kwargs)
+        ax.hist(np.asarray(group.dropna()._values), bins=bins, **kwargs)
         if legend:
             ax.legend()
 
@@ -448,7 +447,7 @@ def hist_series(
             ax = fig.gca()
         elif ax.get_figure() != fig:
             raise AssertionError("passed axis not bound to passed figure")
-        values = self.dropna().values
+        values = np.asarray(self.dropna()._values)
         if legend:
             kwds["label"] = self.name
         ax.hist(values, bins=bins, **kwds)
@@ -539,7 +538,7 @@ def hist_frame(
         data = data[column]
     # GH32590
     data = data.select_dtypes(
-        include=(np.number, "datetime64", "datetimetz"), exclude="timedelta"
+        include=(np.number, "datetime64", DatetimeTZDtype), exclude="timedelta"
     )
     naxes = len(data.columns)
 
@@ -557,15 +556,12 @@ def hist_frame(
         figsize=figsize,
         layout=layout,
     )
-    _axes = flatten_axes(axes)
-
     can_set_label = "label" not in kwds
 
-    for i, col in enumerate(data.columns):
-        ax = _axes[i]
+    for ax, col in zip(flatten_axes(axes), data.columns, strict=False):
         if legend and can_set_label:
             kwds["label"] = col
-        ax.hist(data[col].dropna().values, bins=bins, **kwds)
+        ax.hist(np.asarray(data[col].dropna()._values), bins=bins, **kwds)
         ax.set_title(col)
         ax.grid(grid)
         if legend:

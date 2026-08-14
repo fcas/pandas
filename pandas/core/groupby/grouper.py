@@ -5,18 +5,32 @@ split-apply-combine paradigm.
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import (
     TYPE_CHECKING,
     final,
 )
+import warnings
 
 import numpy as np
 
+from pandas._libs import (
+    algos as libalgos,
+)
 from pandas._libs.tslibs import OutOfBoundsDatetime
-from pandas.errors import InvalidIndexError
-from pandas.util._decorators import cache_readonly
+from pandas.errors import (
+    InvalidIndexError,
+    Pandas4Warning,
+)
+from pandas.util._decorators import (
+    cache_readonly,
+    set_module,
+)
+from pandas.util._exceptions import find_stack_level
 
 from pandas.core.dtypes.common import (
+    ensure_int64,
+    ensure_platform_int,
     is_list_like,
     is_scalar,
 )
@@ -34,10 +48,14 @@ from pandas.core.groupby.categorical import recode_for_groupby
 from pandas.core.indexes.api import (
     Index,
     MultiIndex,
+    default_index,
 )
 from pandas.core.series import Series
 
-from pandas.io.formats.printing import pprint_thing
+from pandas.io.formats.printing import (
+    PrettyDict,
+    pprint_thing,
+)
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -54,6 +72,7 @@ if TYPE_CHECKING:
     from pandas.core.generic import NDFrame
 
 
+@set_module("pandas")
 class Grouper:
     """
     A Grouper allows the user to specify a groupby instruction for an object.
@@ -71,6 +90,9 @@ class Grouper:
         Currently unused, reserved for future use.
     **kwargs
         Dictionary of the keyword arguments to pass to Grouper.
+
+    Attributes
+    ----------
     key : str, defaults to None
         Groupby key, which selects the grouping column of the target.
     level : name/number, defaults to None
@@ -79,7 +101,7 @@ class Grouper:
         This will groupby the specified frequency if the target selection
         (via key or level) is a datetime-like object. For full specification
         of available frequencies, please see :ref:`here<timeseries.offset_aliases>`.
-    sort : bool, default to False
+    sort : bool, default False
         Whether to sort the resulting labels.
     closed : {'left' or 'right'}
         Closed end of interval. Only when `freq` parameter is passed.
@@ -101,9 +123,7 @@ class Grouper:
         - 'end': `origin` is the last value of the timeseries
         - 'end_day': `origin` is the ceiling midnight of the last day
 
-        .. versionadded:: 1.3.0
-
-    offset : Timedelta or str, default is None
+    offset : Timedelta or str, default None
         An offset timedelta added to the origin.
 
     dropna : bool, default True
@@ -274,18 +294,22 @@ class Grouper:
         self._indexer: npt.NDArray[np.intp] | None = None
 
     def _get_grouper(
-        self, obj: NDFrameT, validate: bool = True
+        self, obj: NDFrameT, validate: bool = True, observed: bool = True
     ) -> tuple[ops.BaseGrouper, NDFrameT]:
         """
         Parameters
         ----------
         obj : Series or DataFrame
+            Object being grouped.
         validate : bool, default True
-            if True, validate the grouper
+            If True, validate the grouper.
+        observed : bool, default True
+            Whether only observed groups should be in the result. Only
+            has an impact when grouping on categorical data.
 
         Returns
         -------
-        a tuple of grouper, obj (possibly sorted)
+        A tuple of grouper, obj (possibly sorted)
         """
         obj, _, _ = self._set_grouper(obj)
         grouper, _, obj = get_grouper(
@@ -295,6 +319,7 @@ class Grouper:
             sort=self.sort,
             validate=validate,
             dropna=self.dropna,
+            observed=observed,
         )
 
         return grouper, obj
@@ -343,9 +368,9 @@ class Grouper:
                 if self._indexer is not None:
                     reverse_indexer = self._indexer.argsort()
                     unsorted_ax = self._grouper.take(reverse_indexer)
-                    ax = unsorted_ax.take(obj.index)
+                    ax = unsorted_ax.take(obj.index)  # type: ignore[arg-type]
                 else:
-                    ax = self._grouper.take(obj.index)
+                    ax = self._grouper.take(obj.index)  # type: ignore[arg-type]
             else:
                 if key not in obj._info_axis:
                     raise KeyError(f"The grouper name {key} is not found")
@@ -362,9 +387,8 @@ class Grouper:
                     level = ax._get_level_number(level)
                     ax = Index(ax._get_level_values(level), name=ax.names[level])
 
-                else:
-                    if level not in (0, ax.name):
-                        raise ValueError(f"The level {level} is not valid")
+                elif level not in (0, ax.name):
+                    raise ValueError(f"The level {level} is not valid")
 
         # possibly sort
         indexer: npt.NDArray[np.intp] | None = None
@@ -403,7 +427,7 @@ class Grouping:
     obj : DataFrame or Series
     name : Label
     level :
-    observed : bool, default False
+    observed : bool, default True
         If we are a Categorical, use the observed values
     in_axis : if the Grouping is a column in self.obj and hence among
         Groupby.exclusions list
@@ -436,11 +460,13 @@ class Grouping:
         obj: NDFrame | None = None,
         level=None,
         sort: bool = True,
-        observed: bool = False,
+        observed: bool = True,
         in_axis: bool = False,
         dropna: bool = True,
         uniques: ArrayLike | None = None,
     ) -> None:
+        if isinstance(grouper, Series):
+            grouper = grouper.copy(deep=False)
         self.level = level
         self._orig_grouper = grouper
         grouping_vector = _convert_grouper(index, grouper)
@@ -494,7 +520,9 @@ class Grouping:
                 # error: Cannot determine type of "grouping_vector"  [has-type]
                 ng = newgrouper.groupings[0].grouping_vector  # type: ignore[has-type]
                 # use Index instead of ndarray so we can recover the name
-                grouping_vector = Index(ng, name=newgrouper.result_index.name)
+                grouping_vector = Index(
+                    ng, name=newgrouper.result_index.name, copy=False
+                )
 
         elif not isinstance(
             grouping_vector, (Series, Index, ExtensionArray, np.ndarray)
@@ -512,8 +540,7 @@ class Grouping:
             ):
                 grper = pprint_thing(grouping_vector)
                 errmsg = (
-                    "Grouper result violates len(labels) == "
-                    f"len(data)\nresult: {grper}"
+                    f"Grouper result violates len(labels) == len(data)\nresult: {grper}"
                 )
                 raise AssertionError(errmsg)
 
@@ -572,6 +599,15 @@ class Grouping:
             index = self._index
             if level not in index.names:
                 raise AssertionError(f"Level {level} not in index")
+            if isinstance(index, MultiIndex) and index.names.count(level) > 1:
+                warnings.warn(
+                    f"Grouping by index level '{level}' which matches multiple "
+                    f"index levels is ambiguous. Currently the first matching "
+                    f"level is used. In a future version of pandas, this will "
+                    f"raise a ValueError. Use the level number instead.",
+                    Pandas4Warning,
+                    stacklevel=find_stack_level(),
+                )
             return index.names.index(level)
         return level
 
@@ -645,7 +681,9 @@ class Grouping:
         elif isinstance(self.grouping_vector, ops.BaseGrouper):
             # we have a list of groupers
             codes = self.grouping_vector.codes_info
-            uniques = self.grouping_vector.result_index._values
+            # Pass the full Index (not ._values) so DatetimeIndex/TimedeltaIndex
+            # freq survives the trip through _with_infer.
+            uniques = self.grouping_vector.result_index  # type: ignore[assignment]
         elif self._uniques is not None:
             # GH#50486 Code grouping_vector using _uniques; allows
             # including uniques that are not present in grouping_vector.
@@ -653,20 +691,33 @@ class Grouping:
             codes = cat.codes
             uniques = self._uniques
         else:
-            # GH35667, replace dropna=False with use_na_sentinel=False
-            # error: Incompatible types in assignment (expression has type "Union[
-            # ndarray[Any, Any], Index]", variable has type "Categorical")
-            codes, uniques = algorithms.factorize(  # type: ignore[assignment]
-                self.grouping_vector, sort=self._sort, use_na_sentinel=self._dropna
-            )
+            result = _factorize_monotonic(self.grouping_vector, self._sort)
+            if result is not None:
+                codes, uniques = result
+            else:
+                # GH35667, replace dropna=False with use_na_sentinel=False
+                # error: Incompatible types in assignment (expression has type
+                # "Union[ndarray[Any, Any], Index]", variable has type
+                # "Categorical")
+                codes, uniques = algorithms.factorize(  # type: ignore[assignment]
+                    self.grouping_vector,
+                    sort=self._sort,
+                    use_na_sentinel=self._dropna,
+                )
         return codes, uniques
 
     @cache_readonly
     def groups(self) -> dict[Hashable, Index]:
         codes, uniques = self._codes_and_uniques
-        uniques = Index._with_infer(uniques, name=self.name)
-        cats = Categorical.from_codes(codes, uniques, validate=False)
-        return self._index.groupby(cats)
+        uniques = Index._with_infer(uniques, name=self.name, copy=False)  # type: ignore[assignment]
+
+        r, counts = libalgos.groupsort_indexer(ensure_platform_int(codes), len(uniques))
+        counts = ensure_int64(counts).cumsum()
+        _result = (r[start:end] for start, end in pairwise(counts))
+        # map to the label
+        result = {k: self._index.take(v) for k, v in zip(uniques, _result, strict=True)}
+
+        return PrettyDict(result)
 
     @property
     def observed_grouping(self) -> Grouping:
@@ -696,7 +747,7 @@ def get_grouper(
     key=None,
     level=None,
     sort: bool = True,
-    observed: bool = False,
+    observed: bool = True,
     validate: bool = True,
     dropna: bool = True,
 ) -> tuple[ops.BaseGrouper, frozenset[Hashable], NDFrameT]:
@@ -770,7 +821,7 @@ def get_grouper(
 
     # a passed-in Grouper, directly convert
     if isinstance(key, Grouper):
-        grouper, obj = key._get_grouper(obj, validate=False)
+        grouper, obj = key._get_grouper(obj, validate=False, observed=observed)
         if key.key is None:
             return grouper, frozenset(), obj
         else:
@@ -853,7 +904,7 @@ def get_grouper(
             return gpr._mgr.references_same_values(obj_gpr_column._mgr, 0)
         return False
 
-    for gpr, level in zip(keys, levels):
+    for gpr, level in zip(keys, levels, strict=True):
         if is_in_obj(gpr):  # df.groupby(df['name'])
             in_axis = True
             exclusions.add(gpr.name)
@@ -901,7 +952,7 @@ def get_grouper(
     if len(groupings) == 0 and len(obj):
         raise ValueError("No group keys passed!")
     if len(groupings) == 0:
-        groupings.append(Grouping(Index([], dtype="int"), np.array([], dtype=np.intp)))
+        groupings.append(Grouping(default_index(0), np.array([], dtype=np.intp)))
 
     # create the internals grouper
     grouper = ops.BaseGrouper(group_axis, groupings, sort=sort, dropna=dropna)
@@ -910,6 +961,60 @@ def get_grouper(
 
 def _is_label_like(val) -> bool:
     return isinstance(val, (str, tuple)) or (val is not None and is_scalar(val))
+
+
+def _factorize_monotonic(
+    grouping_vector,
+    sort: bool,
+) -> tuple | None:
+    """
+    Fast-path factorization for monotonic (sorted) grouping vectors.
+
+    Uses adjacent-element comparison instead of hash table construction.
+    Returns (codes, uniques) or None if the fast path is not applicable.
+
+    Since monotonic arrays contain no NA values (NAs break monotonicity
+    checks for n >= 2), NA handling is not needed here.
+    """
+    if isinstance(grouping_vector, (Series, Index)):
+        # Bail before np.asarray for extension dtypes (PeriodDtype,
+        # DatetimeTZDtype, etc.) — converting them would box every element.
+        dtype = grouping_vector.dtype
+        if not isinstance(dtype, np.dtype) or dtype.kind not in "iufmMb":
+            return None
+        if isinstance(grouping_vector, Index) and dtype.kind in "mM":
+            # DatetimeIndex/TimedeltaIndex.factorize has its own fastpaths
+            # (freq-based and monotonic) that retain freq and Index uniques
+            return None
+        ascending = grouping_vector.is_monotonic_increasing
+        if not ascending and not grouping_vector.is_monotonic_decreasing:
+            return None
+        arr = np.asarray(grouping_vector)
+    elif isinstance(grouping_vector, np.ndarray):
+        arr = grouping_vector
+        if arr.dtype.kind not in "iufmMb":
+            return None
+        if len(arr) <= 1:
+            return None
+        # Quick sample check: compare a few spaced elements to avoid
+        # a full O(n) scan on clearly unsorted data.
+        sample_idx = np.linspace(0, len(arr) - 1, num=min(8, len(arr)), dtype=np.intp)
+        sample = arr[sample_idx]
+        if not bool(np.all(sample[1:] >= sample[:-1])):
+            if not bool(np.all(sample[1:] <= sample[:-1])):
+                return None
+        ascending = bool(np.all(arr[1:] >= arr[:-1]))
+        if not ascending:
+            if not bool(np.all(arr[1:] <= arr[:-1])):
+                return None
+    else:
+        return None
+
+    if len(arr) <= 1:
+        return None
+
+    codes, uniques_indexer = algorithms.factorize_monotonic_codes(arr, ascending, sort)
+    return codes, arr[uniques_indexer]
 
 
 def _convert_grouper(axis: Index, grouper):

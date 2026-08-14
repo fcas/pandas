@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import warnings
 
 import numpy as np
+
+from pandas._config import using_infer_freq_offset
 
 from pandas._libs import lib
 from pandas._libs.algos import unique_deltas
@@ -13,10 +16,8 @@ from pandas._libs.tslibs import (
     tz_convert_from_utc,
 )
 from pandas._libs.tslibs.ccalendar import (
-    DAYS,
     MONTH_ALIASES,
     MONTH_NUMBERS,
-    MONTHS,
     int_to_weekday,
 )
 from pandas._libs.tslibs.dtypes import OFFSET_TO_PERIOD_FREQSTR
@@ -25,15 +26,21 @@ from pandas._libs.tslibs.fields import (
     month_position_check,
 )
 from pandas._libs.tslibs.offsets import (
-    DateOffset,
+    BaseOffset,
     Day,
     to_offset,
 )
 from pandas._libs.tslibs.parsing import get_rule_month
-from pandas.util._decorators import cache_readonly
+from pandas.errors import Pandas4Warning
+from pandas.util._decorators import (
+    cache_readonly,
+    set_module,
+)
+from pandas.util._exceptions import find_stack_level
 
 from pandas.core.dtypes.common import is_numeric_dtype
 from pandas.core.dtypes.dtypes import (
+    ArrowDtype,
     DatetimeTZDtype,
     PeriodDtype,
 )
@@ -41,8 +48,6 @@ from pandas.core.dtypes.generic import (
     ABCIndex,
     ABCSeries,
 )
-
-from pandas.core.algorithms import unique
 
 if TYPE_CHECKING:
     from pandas._typing import npt
@@ -56,21 +61,6 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------
 # Offset related functions
 
-_need_suffix = ["QS", "BQE", "BQS", "YS", "BYE", "BYS"]
-
-for _prefix in _need_suffix:
-    for _m in MONTHS:
-        key = f"{_prefix}-{_m}"
-        OFFSET_TO_PERIOD_FREQSTR[key] = OFFSET_TO_PERIOD_FREQSTR[_prefix]
-
-for _prefix in ["Y", "Q"]:
-    for _m in MONTHS:
-        _alias = f"{_prefix}-{_m}"
-        OFFSET_TO_PERIOD_FREQSTR[_alias] = _alias
-
-for _d in DAYS:
-    OFFSET_TO_PERIOD_FREQSTR[f"W-{_d}"] = f"W-{_d}"
-
 
 def get_period_alias(offset_str: str) -> str | None:
     """
@@ -79,15 +69,126 @@ def get_period_alias(offset_str: str) -> str | None:
     return OFFSET_TO_PERIOD_FREQSTR.get(offset_str, None)
 
 
+def maybe_convert_inferred_freq(
+    freq_str: str | None, caller: str, expr: str | None = None
+) -> str | BaseOffset | None:
+    """
+    Implement the GH#55504 deprecation of inferred frequencies being returned
+    as strings rather than BaseOffset objects.
+
+    Parameters
+    ----------
+    freq_str : str or None
+        The inferred frequency, as returned by infer_freq_str.
+    caller : str
+        User-facing name of the attribute or function being called, used in
+        the warning message.
+    expr : str, optional
+        Expression the user can append ``.freqstr`` to in order to keep the
+        string result. Defaults to `caller`.
+
+    Returns
+    -------
+    str, BaseOffset, or None
+    """
+    if freq_str is None:
+        # The result is None either way, so there is no behavior change
+        #  to warn about.
+        return None
+
+    opt = using_infer_freq_offset()
+    if opt is True:
+        return to_offset(freq_str)
+    if opt is None:
+        warnings.warn(
+            f"A future version of pandas will return a BaseOffset object "
+            f"instead of a string from {caller}. "
+            f"Use pd.set_option('future.infer_freq_returns_offset', True) "
+            f"to get the future behavior, or set to False to keep the old "
+            f"behavior and silence this warning. To preserve the string "
+            f"representation, use ``{expr or caller}.freqstr``.",
+            Pandas4Warning,
+            stacklevel=find_stack_level(),
+        )
+    return freq_str
+
+
 # ---------------------------------------------------------------------
 # Period codes
 
 
-def infer_freq(
+def infer_freq_str(
     index: DatetimeIndex | TimedeltaIndex | Series | DatetimeLikeArrayMixin,
 ) -> str | None:
     """
+    Internal version of infer_freq that returns a string without
+    emitting a deprecation warning.
+    """
+    from pandas.core.api import DatetimeIndex
+
+    if isinstance(index, ABCSeries):
+        values = index._values
+
+        if isinstance(index.dtype, ArrowDtype):
+            import pyarrow as pa
+
+            if pa.types.is_timestamp(values.dtype.pyarrow_dtype):
+                # GH#58403
+                values = values._to_datetimearray()
+
+        if not (
+            lib.is_np_dtype(values.dtype, "mM")
+            or isinstance(values.dtype, DatetimeTZDtype)
+            or values.dtype == object
+        ):
+            raise TypeError(
+                "cannot infer freq from a non-convertible dtype "
+                f"on a Series of {index.dtype}"
+            )
+        index = values
+
+    inferer: _FrequencyInferer
+
+    if not hasattr(index, "dtype"):
+        pass
+    elif isinstance(index.dtype, PeriodDtype):
+        raise TypeError(
+            "PeriodIndex given. Check the `freq` attribute instead of using infer_freq."
+        )
+    elif lib.is_np_dtype(index.dtype, "m"):
+        # Allow TimedeltaIndex and TimedeltaArray
+        inferer = _TimedeltaFrequencyInferer(index)
+        return inferer.get_freq()
+
+    elif is_numeric_dtype(index.dtype):
+        raise TypeError(
+            f"cannot infer freq from a non-convertible index of dtype {index.dtype}"
+        )
+
+    if not isinstance(index, DatetimeIndex):
+        index = DatetimeIndex(index, copy=False)
+
+    inferer = _FrequencyInferer(index)
+    return inferer.get_freq()
+
+
+@set_module("pandas")
+def infer_freq(
+    index: DatetimeIndex | TimedeltaIndex | Series | DatetimeLikeArrayMixin,
+) -> str | BaseOffset | None:
+    """
     Infer the most likely frequency given the input index.
+
+    .. deprecated:: 3.1.0
+        A future version of pandas will return a :class:`BaseOffset` instead of
+        a string. Use
+        ``pd.set_option('future.infer_freq_returns_offset', True)`` to opt in
+        to the future behavior.
+
+    This method attempts to deduce the most probable frequency (e.g., 'D' for daily,
+    'H' for hourly) from a sequence of datetime-like objects. It is particularly useful
+    when the frequency of a time series is not explicitly set or known but can be
+    inferred from its values.
 
     Parameters
     ----------
@@ -106,51 +207,22 @@ def infer_freq(
     ValueError
         If there are fewer than three values.
 
+    See Also
+    --------
+    date_range : Return a fixed frequency DatetimeIndex.
+    timedelta_range : Return a fixed frequency TimedeltaIndex with day as the default.
+    period_range : Return a fixed frequency PeriodIndex.
+    DatetimeIndex.freq : Return the frequency object if it is set, otherwise None.
+
     Examples
     --------
     >>> idx = pd.date_range(start="2020/12/01", end="2020/12/30", periods=30)
-    >>> pd.infer_freq(idx)
+    >>> pd.infer_freq(idx)  # doctest: +SKIP
     'D'
     """
-    from pandas.core.api import DatetimeIndex
-
-    if isinstance(index, ABCSeries):
-        values = index._values
-        if not (
-            lib.is_np_dtype(values.dtype, "mM")
-            or isinstance(values.dtype, DatetimeTZDtype)
-            or values.dtype == object
-        ):
-            raise TypeError(
-                "cannot infer freq from a non-convertible dtype "
-                f"on a Series of {index.dtype}"
-            )
-        index = values
-
-    inferer: _FrequencyInferer
-
-    if not hasattr(index, "dtype"):
-        pass
-    elif isinstance(index.dtype, PeriodDtype):
-        raise TypeError(
-            "PeriodIndex given. Check the `freq` attribute "
-            "instead of using infer_freq."
-        )
-    elif lib.is_np_dtype(index.dtype, "m"):
-        # Allow TimedeltaIndex and TimedeltaArray
-        inferer = _TimedeltaFrequencyInferer(index)
-        return inferer.get_freq()
-
-    elif is_numeric_dtype(index.dtype):
-        raise TypeError(
-            f"cannot infer freq from a non-convertible index of dtype {index.dtype}"
-        )
-
-    if not isinstance(index, DatetimeIndex):
-        index = DatetimeIndex(index)
-
-    inferer = _FrequencyInferer(index)
-    return inferer.get_freq()
+    return maybe_convert_inferred_freq(
+        infer_freq_str(index), "infer_freq", expr="infer_freq(...)"
+    )
 
 
 class _FrequencyInferer:
@@ -260,12 +332,12 @@ class _FrequencyInferer:
     @cache_readonly
     def day_deltas(self) -> list[int]:
         ppd = periods_per_day(self._creso)
-        return [x / ppd for x in self.deltas]
+        return [x // ppd for x in self.deltas]
 
     @cache_readonly
     def hour_deltas(self) -> list[int]:
         pph = periods_per_day(self._creso) // 24
-        return [x / pph for x in self.deltas]
+        return [x // pph for x in self.deltas]
 
     @cache_readonly
     def fields(self) -> np.ndarray:  # structured array of fields
@@ -276,7 +348,7 @@ class _FrequencyInferer:
         return Timestamp(self.i8values[0], unit=self.index.unit)
 
     def month_position_check(self) -> str | None:
-        return month_position_check(self.fields, self.index.dayofweek)
+        return month_position_check(self.fields, self.index.day_of_week)
 
     @cache_readonly
     def mdiffs(self) -> npt.NDArray[np.int64]:
@@ -298,7 +370,14 @@ class _FrequencyInferer:
         quarterly_rule = self._get_quarterly_rule()
         if quarterly_rule:
             nquarters = self.mdiffs[0] / 3
-            mod_dict = {0: 12, 2: 11, 1: 10}
+            if quarterly_rule in ("QS", "BQS"):
+                # GH#36939 the anchor month is only known up to mod 3; use the
+                #  first-calendar-quarter representative so that to_period on
+                #  e.g. Jan/Apr/Jul/Oct starts (QS-JAN) keeps the calendar
+                #  convention Q-DEC
+                mod_dict = {1: 1, 2: 2, 0: 3}
+            else:
+                mod_dict = {0: 12, 2: 11, 1: 10}
             month = MONTH_ALIASES[mod_dict[self.rep_stamp.month % 3]]
             alias = f"{quarterly_rule}-{month}"
             return _maybe_add_count(alias, nquarters)
@@ -334,7 +413,7 @@ class _FrequencyInferer:
         if len(self.ydiffs) > 1:
             return None
 
-        if len(unique(self.fields["M"])) > 1:
+        if len(np.unique(self.fields["M"])) > 1:
             return None
 
         pos_check = self.month_position_check()
@@ -388,11 +467,11 @@ class _FrequencyInferer:
         )
 
     def _get_wom_rule(self) -> str | None:
-        weekdays = unique(self.index.weekday)
+        weekdays = np.unique(self.index.day_of_week)
         if len(weekdays) > 1:
             return None
 
-        week_of_months = unique((self.index.day - 1) // 7)
+        week_of_months = np.unique((self.index.day - 1) // 7)
         # Only attempt to infer up to WOM-4. See #9425
         week_of_months = week_of_months[week_of_months < 4]
         if len(week_of_months) == 0 or len(week_of_months) > 1:
@@ -450,15 +529,21 @@ def is_subperiod(source, target) -> bool:
     target = _maybe_coerce_freq(target)
 
     if _is_annual(target):
+        if _is_annual(source):
+            return get_rule_month(source) == get_rule_month(target)
         if _is_quarterly(source):
             return _quarter_months_conform(
                 get_rule_month(source), get_rule_month(target)
             )
         return source in {"D", "C", "B", "M", "h", "min", "s", "ms", "us", "ns"}
     elif _is_quarterly(target):
+        if _is_quarterly(source):
+            return _quarter_months_conform(
+                get_rule_month(source), get_rule_month(target)
+            )
         return source in {"D", "C", "B", "M", "h", "min", "s", "ms", "us", "ns"}
     elif _is_monthly(target):
-        return source in {"D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
+        return source in {target, "D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
     elif _is_weekly(target):
         return source in {target, "D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
     elif target == "B":
@@ -514,9 +599,13 @@ def is_superperiod(source, target) -> bool:
             return _quarter_months_conform(smonth, tmonth)
         return target in {"D", "C", "B", "M", "h", "min", "s", "ms", "us", "ns"}
     elif _is_quarterly(source):
+        if _is_quarterly(target):
+            return _quarter_months_conform(
+                get_rule_month(source), get_rule_month(target)
+            )
         return target in {"D", "C", "B", "M", "h", "min", "s", "ms", "us", "ns"}
     elif _is_monthly(source):
-        return target in {"D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
+        return target in {source, "D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
     elif _is_weekly(source):
         return target in {source, "D", "C", "B", "h", "min", "s", "ms", "us", "ns"}
     elif source == "B":
@@ -555,8 +644,11 @@ def _maybe_coerce_freq(code) -> str:
     str
     """
     assert code is not None
-    if isinstance(code, DateOffset):
-        code = PeriodDtype(to_offset(code.name))._freqstr
+    if isinstance(code, BaseOffset):
+        code = PeriodDtype(to_offset(code.rule_code))._freqstr
+    # Strip any leading multiplier digits (e.g. '12h' -> 'h') so that
+    # is_subperiod / is_superperiod can compare base frequency codes.  GH#50355
+    code = code.lstrip("0123456789")
     if code in {"h", "min", "s", "ms", "us", "ns"}:
         return code
     else:

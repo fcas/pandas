@@ -7,6 +7,9 @@ DataFrame
 =========
 .. currentmodule:: pandas
 
+.. note::
+   For an introduction to using DataFrames, see :ref:`basics`.
+
 Constructor
 ~~~~~~~~~~~
 .. autosummary::
@@ -111,6 +114,13 @@ Binary operator functions
    DataFrame.combine
    DataFrame.combine_first
 
+Unary operator functions
+~~~~~~~~~~~~~~~~~~~~~~~~
+.. autosummary::
+   :toctree: api/
+
+   DataFrame.__invert__
+
 Function application, GroupBy & window
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. autosummary::
@@ -185,7 +195,6 @@ Reindexing / selection / label manipulation
    DataFrame.duplicated
    DataFrame.equals
    DataFrame.filter
-   DataFrame.head
    DataFrame.idxmax
    DataFrame.idxmin
    DataFrame.reindex
@@ -196,7 +205,6 @@ Reindexing / selection / label manipulation
    DataFrame.sample
    DataFrame.set_axis
    DataFrame.set_index
-   DataFrame.tail
    DataFrame.take
    DataFrame.truncate
 
@@ -274,7 +282,7 @@ Flags
 ~~~~~
 
 Flags refer to attributes of the pandas object. Properties of the dataset (like
-the date is was recorded, the URL it was accessed from, etc.) should be stored
+the date it was recorded, the URL it was accessed from, etc.) should be stored
 in :attr:`DataFrame.attrs`.
 
 .. autosummary::
@@ -362,6 +370,7 @@ Serialization / IO / conversion
 .. autosummary::
    :toctree: api/
 
+   DataFrame.from_arrow
    DataFrame.from_dict
    DataFrame.from_records
    DataFrame.to_orc

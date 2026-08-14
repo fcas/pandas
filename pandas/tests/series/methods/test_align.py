@@ -1,4 +1,4 @@
-from datetime import timezone
+from datetime import UTC
 
 import numpy as np
 import pytest
@@ -84,10 +84,6 @@ def test_align_nocopy(datetime_series):
 
 def test_align_same_index(datetime_series):
     a, b = datetime_series.align(datetime_series)
-    assert a.index.is_(datetime_series.index)
-    assert b.index.is_(datetime_series.index)
-
-    a, b = datetime_series.align(datetime_series)
     assert a.index is not datetime_series.index
     assert b.index is not datetime_series.index
     assert a.index.is_(datetime_series.index)
@@ -136,8 +132,8 @@ def test_align_dt64tzindex_mismatched_tzs():
     # different timezones convert to UTC
 
     new1, new2 = ser.align(ser_central)
-    assert new1.index.tz is timezone.utc
-    assert new2.index.tz is timezone.utc
+    assert new1.index.tz is UTC
+    assert new2.index.tz is UTC
 
 
 def test_align_periodindex(join_type):
@@ -146,6 +142,19 @@ def test_align_periodindex(join_type):
 
     # TODO: assert something?
     ts.align(ts[::2], join=join_type)
+
+
+def test_align_stringindex(any_string_dtype):
+    left = Series(range(3), index=pd.Index(["a", "b", "d"], dtype=any_string_dtype))
+    right = Series(range(3), index=pd.Index(["a", "b", "c"], dtype=any_string_dtype))
+    result_left, result_right = left.align(right)
+
+    expected_idx = pd.Index(["a", "b", "c", "d"], dtype=any_string_dtype)
+    expected_left = Series([0, 1, np.nan, 2], index=expected_idx)
+    expected_right = Series([0, 1, 2, np.nan], index=expected_idx)
+
+    tm.assert_series_equal(result_left, expected_left)
+    tm.assert_series_equal(result_right, expected_right)
 
 
 def test_align_left_fewer_levels():

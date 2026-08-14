@@ -1,14 +1,17 @@
 # TODO(npdtypes): Many types specified here can be made more specific/accurate;
 #  the more specific versions are specified in comments
+from collections.abc import (
+    Callable,
+    Generator,
+    Hashable,
+)
 from decimal import Decimal
 from typing import (
     Any,
-    Callable,
     Final,
-    Generator,
-    Hashable,
     Literal,
     TypeAlias,
+    TypeGuard,
     overload,
 )
 
@@ -17,7 +20,6 @@ import numpy as np
 from pandas._typing import (
     ArrayLike,
     DtypeObj,
-    TypeGuard,
     npt,
 )
 
@@ -58,8 +60,9 @@ def is_time_array(values: np.ndarray, skipna: bool = ...): ...
 def is_date_array(values: np.ndarray, skipna: bool = ...): ...
 def is_datetime_array(values: np.ndarray, skipna: bool = ...): ...
 def is_string_array(values: np.ndarray, skipna: bool = ...): ...
-def is_float_array(values: np.ndarray): ...
+def is_float_array(values: np.ndarray, skipna: bool = ...): ...
 def is_integer_array(values: np.ndarray, skipna: bool = ...): ...
+def is_integer_float_array(values: np.ndarray, skipna: bool = ...): ...
 def is_bool_array(values: np.ndarray, skipna: bool = ...): ...
 def fast_multiget(
     mapping: dict,
@@ -219,6 +222,16 @@ def array_equivalent_object(
     right: npt.NDArray[np.object_],
 ) -> bool: ...
 def has_infs(arr: np.ndarray) -> bool: ...  # const floating[:]
+def has_nans(arr: np.ndarray) -> bool: ...  # const floating[:]
+def all_nans(arr: np.ndarray) -> bool: ...  # const floating[:]
+def array_equivalent_float(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> bool: ...  # const floating[:]
+def array_equivalent_bytes(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> bool: ...
 def has_only_ints_or_nan(arr: np.ndarray) -> bool: ...  # const floating[:]
 def get_reverse_indexer(
     indexer: np.ndarray,  # const intp_t[:]
@@ -233,4 +246,8 @@ def is_range_indexer(
 def is_sequence_range(
     sequence: np.ndarray,
     step: int,  # np.ndarray[np.int64, ndim=1]
+) -> bool: ...
+def has_sentinel(
+    arr: np.ndarray,  # const signed_int_t[:]
+    sentinel: int,
 ) -> bool: ...

@@ -31,7 +31,9 @@ class TestSeriesToCSV:
         path = temp_file
         datetime_series.to_csv(path, header=False)
         ts = self.read_csv(path, parse_dates=True)
-        tm.assert_series_equal(datetime_series, ts, check_names=False)
+        expected = datetime_series.copy()
+        expected.index = expected.index.as_unit("us")
+        tm.assert_series_equal(expected, ts, check_names=False)
 
         assert ts.name is None
         assert ts.index.name is None
@@ -170,8 +172,5 @@ class TestSeriesToCSV:
 
         # can't roundtrip intervalindex via read_csv so check string repr (GH 23595)
         expected = s
-        if using_infer_string:
-            expected.index = expected.index.astype("string[pyarrow_numpy]")
-        else:
-            expected.index = expected.index.astype(str)
+        expected.index = expected.index.astype("str")
         tm.assert_series_equal(result, expected)

@@ -155,7 +155,7 @@ def test_copy_in_constructor():
 def test_from_arrays(idx):
     arrays = [
         np.asarray(lev).take(level_codes)
-        for lev, level_codes in zip(idx.levels, idx.codes)
+        for lev, level_codes in zip(idx.levels, idx.codes, strict=True)
     ]
 
     # list of arrays as input
@@ -172,7 +172,7 @@ def test_from_arrays_iterator(idx):
     # GH 18434
     arrays = [
         np.asarray(lev).take(level_codes)
-        for lev, level_codes in zip(idx.levels, idx.codes)
+        for lev, level_codes in zip(idx.levels, idx.codes, strict=True)
     ]
 
     # iterator as input
@@ -188,7 +188,7 @@ def test_from_arrays_iterator(idx):
 def test_from_arrays_tuples(idx):
     arrays = tuple(
         tuple(np.asarray(lev).take(level_codes))
-        for lev, level_codes in zip(idx.levels, idx.codes)
+        for lev, level_codes in zip(idx.levels, idx.codes, strict=True)
     )
 
     # tuple of tuples as input
@@ -215,14 +215,14 @@ def test_from_arrays_tuples(idx):
 )
 def test_from_arrays_index_series_period_datetimetz_and_timedelta(idx1, idx2):
     result = MultiIndex.from_arrays([idx1, idx2])
-    tm.assert_index_equal(result.get_level_values(0), idx1)
-    tm.assert_index_equal(result.get_level_values(1), idx2)
+    tm.assert_index_equal(result.get_level_values(0), idx1, check_freq=False)
+    tm.assert_index_equal(result.get_level_values(1), idx2, check_freq=False)
 
     result2 = MultiIndex.from_arrays([Series(idx1), Series(idx2)])
-    tm.assert_index_equal(result2.get_level_values(0), idx1)
-    tm.assert_index_equal(result2.get_level_values(1), idx2)
+    tm.assert_index_equal(result2.get_level_values(0), idx1, check_freq=False)
+    tm.assert_index_equal(result2.get_level_values(1), idx2, check_freq=False)
 
-    tm.assert_index_equal(result, result2)
+    tm.assert_index_equal(result, result2, check_freq=False)
 
 
 def test_from_arrays_index_datetimelike_mixed():
@@ -232,20 +232,20 @@ def test_from_arrays_index_datetimelike_mixed():
     idx4 = pd.period_range("2011-01-01", freq="D", periods=3)
 
     result = MultiIndex.from_arrays([idx1, idx2, idx3, idx4])
-    tm.assert_index_equal(result.get_level_values(0), idx1)
-    tm.assert_index_equal(result.get_level_values(1), idx2)
-    tm.assert_index_equal(result.get_level_values(2), idx3)
+    tm.assert_index_equal(result.get_level_values(0), idx1, check_freq=False)
+    tm.assert_index_equal(result.get_level_values(1), idx2, check_freq=False)
+    tm.assert_index_equal(result.get_level_values(2), idx3, check_freq=False)
     tm.assert_index_equal(result.get_level_values(3), idx4)
 
     result2 = MultiIndex.from_arrays(
         [Series(idx1), Series(idx2), Series(idx3), Series(idx4)]
     )
-    tm.assert_index_equal(result2.get_level_values(0), idx1)
-    tm.assert_index_equal(result2.get_level_values(1), idx2)
-    tm.assert_index_equal(result2.get_level_values(2), idx3)
+    tm.assert_index_equal(result2.get_level_values(0), idx1, check_freq=False)
+    tm.assert_index_equal(result2.get_level_values(1), idx2, check_freq=False)
+    tm.assert_index_equal(result2.get_level_values(2), idx3, check_freq=False)
     tm.assert_index_equal(result2.get_level_values(3), idx4)
 
-    tm.assert_index_equal(result, result2)
+    tm.assert_index_equal(result, result2, check_freq=False)
 
 
 def test_from_arrays_index_series_categorical():
@@ -368,11 +368,11 @@ def test_from_tuples_iterator():
         levels=[[1, 3], [2, 4]], codes=[[0, 1], [0, 1]], names=["a", "b"]
     )
 
-    result = MultiIndex.from_tuples(zip([1, 3], [2, 4]), names=["a", "b"])
+    result = MultiIndex.from_tuples(zip([1, 3], [2, 4], strict=True), names=["a", "b"])
     tm.assert_index_equal(result, expected)
 
     # input non-iterables
-    msg = "Input must be a list / sequence of tuple-likes."
+    msg = "Input must be list-like of tuples."
     with pytest.raises(TypeError, match=msg):
         MultiIndex.from_tuples(0)
 
@@ -408,6 +408,19 @@ def test_from_tuples_with_tuple_label():
     idx = MultiIndex.from_tuples([(2, 1), (4, (1, 2))], names=("a", "b"))
     result = pd.DataFrame([2, 3], columns=["c"], index=idx)
     tm.assert_frame_equal(expected, result)
+
+
+@pytest.mark.parametrize(
+    "keys, expected",
+    [
+        ((("l1",), ("l1", "l2")), (("l1", np.nan), ("l1", "l2"))),
+        ((("l1", "l2"), ("l1",)), (("l1", "l2"), ("l1", np.nan))),
+    ],
+)
+def test_from_tuples_with_various_tuple_lengths(keys, expected):
+    # GH 60695
+    idx = MultiIndex.from_tuples(keys)
+    assert tuple(idx) == expected
 
 
 # ----------------------------------------------------------------------------
@@ -451,7 +464,9 @@ def test_from_product_empty_three_levels(N):
     "invalid_input", [1, [1], [1, 2], [[1], 2], "a", ["a"], ["a", "b"], [["a"], "b"]]
 )
 def test_from_product_invalid_input(invalid_input):
-    msg = r"Input must be a list / sequence of iterables|Input must be list-like"
+    msg = "|".join(
+        ["Input must be a list / sequence of iterables", "Input must be list-like"]
+    )
     with pytest.raises(TypeError, match=msg):
         MultiIndex.from_product(iterables=invalid_input)
 
@@ -468,6 +483,18 @@ def test_from_product_datetimeindex():
         ]
     )
     tm.assert_numpy_array_equal(mi.values, etalon)
+
+
+def test_from_product_preserves_datetime_date():
+    # GH#28152 python datetime.date labels must not be upcast to Timestamp
+    day = date(2019, 2, 2)
+    mi = MultiIndex.from_product([[day, day], [2, 3]])
+    assert mi[0] == (day, 2)
+    assert type(mi[0][0]) is date
+
+    # from_tuples is explicitly called out in the issue as having the same bug
+    mt = MultiIndex.from_tuples([(day, 2), (day, 3)])
+    assert type(mt[0][0]) is date
 
 
 def test_from_product_rangeindex():
@@ -652,14 +679,14 @@ def test_from_frame_missing_values_multiIndex():
     df = pd.DataFrame(
         {
             "a": Series([1, 2, None], dtype="Int64"),
-            "b": pd.Float64Dtype().__from_arrow__(pa.array([0.2, np.nan, None])),
+            "b": pd.Float64Dtype().__from_arrow__(pa.array([0.2, None, None])),
         }
     )
     multi_indexed = MultiIndex.from_frame(df)
     expected = MultiIndex.from_arrays(
         [
-            Series([1, 2, None]).astype("Int64"),
-            pd.Float64Dtype().__from_arrow__(pa.array([0.2, np.nan, None])),
+            Series([1, 2, None], dtype="Int64"),
+            pd.Float64Dtype().__from_arrow__(pa.array([0.2, None, None])),
         ],
         names=["a", "b"],
     )
@@ -707,7 +734,7 @@ def test_from_frame_dtype_fidelity():
     mi = MultiIndex.from_frame(df)
     mi_dtypes = {name: mi.levels[i].dtype for i, name in enumerate(mi.names)}
 
-    tm.assert_index_equal(expected_mi, mi)
+    tm.assert_index_equal(expected_mi, mi, check_freq=False)
     assert original_dtypes == mi_dtypes
 
 
@@ -749,7 +776,7 @@ def test_index_equal_empty_iterable():
 
 
 def test_raise_invalid_sortorder():
-    # Test that the MultiIndex constructor raise when a incorrect sortorder is given
+    # Test that the MultiIndex constructor raise when an incorrect sortorder is given
     # GH#28518
 
     levels = [[0, 1], [0, 1, 2]]
@@ -850,7 +877,7 @@ def test_dtype_representation(using_infer_string):
     # GH#46900
     pmidx = MultiIndex.from_arrays([[1], ["a"]], names=[("a", "b"), ("c", "d")])
     result = pmidx.dtypes
-    exp = "object" if not using_infer_string else "string"
+    exp = "object" if not using_infer_string else pd.StringDtype(na_value=np.nan)
     expected = Series(
         ["int64", exp],
         index=MultiIndex.from_tuples([("a", "b"), ("c", "d")]),

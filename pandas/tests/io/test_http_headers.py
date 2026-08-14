@@ -8,6 +8,8 @@ from io import BytesIO
 
 import pytest
 
+from pandas._config import using_string_dtype
+
 import pandas.util._test_decorators as td
 
 import pandas as pd
@@ -18,6 +20,9 @@ pytestmark = [
     pytest.mark.network,
     pytest.mark.filterwarnings(
         "ignore:Passing a BlockManager to DataFrame:DeprecationWarning"
+    ),
+    pytest.mark.filterwarnings(
+        "ignore:The 'fastparquet' engine is deprecated:DeprecationWarning"
     ),
 ]
 
@@ -104,6 +109,7 @@ def stata_responder(df):
             marks=[
                 td.skip_if_no("fastparquet"),
                 td.skip_if_no("fsspec"),
+                pytest.mark.xfail(using_string_dtype(), reason="TODO(infer_string"),
             ],
         ),
         (pickle_respnder, pd.read_pickle),
@@ -163,9 +169,11 @@ def test_to_parquet_to_disk_with_storage_options(engine):
     pytest.importorskip(engine)
 
     true_df = pd.DataFrame({"column_name": ["column_value"]})
-    msg = (
-        "storage_options passed with file object or non-fsspec file path|"
-        "storage_options passed with buffer, or non-supported URL"
+    msg = "|".join(
+        [
+            "storage_options passed with file object or non-fsspec file path",
+            "storage_options passed with buffer, or non-supported URL",
+        ]
     )
     with pytest.raises(ValueError, match=msg):
         true_df.to_parquet("/tmp/junk.parquet", storage_options=headers, engine=engine)

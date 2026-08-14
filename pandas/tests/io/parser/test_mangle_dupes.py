@@ -8,18 +8,17 @@ from io import StringIO
 
 import pytest
 
-from pandas import DataFrame
+from pandas import (
+    DataFrame,
+    Index,
+)
 import pandas._testing as tm
-
-xfail_pyarrow = pytest.mark.usefixtures("pyarrow_xfail")
-
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Passing a BlockManager to DataFrame:DeprecationWarning"
 )
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
 def test_basic(all_parsers):
     parser = all_parsers
 
@@ -30,7 +29,6 @@ def test_basic(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
 def test_basic_names(all_parsers):
     # See gh-7160
     parser = all_parsers
@@ -51,7 +49,6 @@ def test_basic_names_raise(all_parsers):
         parser.read_csv(StringIO(data), names=["a", "b", "a"])
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
 @pytest.mark.parametrize(
     "data,expected",
     [
@@ -119,7 +116,6 @@ def test_thorough_mangle_names(all_parsers, data, names, expected):
         parser.read_csv(StringIO(data), names=names)
 
 
-@xfail_pyarrow  # AssertionError: DataFrame.columns are different
 def test_mangled_unnamed_placeholders(all_parsers):
     # xref gh-13017
     orig_key = "0"
@@ -130,10 +126,10 @@ def test_mangled_unnamed_placeholders(all_parsers):
 
     # This test recursively updates `df`.
     for i in range(3):
-        expected = DataFrame()
+        expected = DataFrame(columns=Index([], dtype="str"))
 
         for j in range(i + 1):
-            col_name = "Unnamed: 0" + f".{1*j}" * min(j, 1)
+            col_name = "Unnamed: 0" + f".{1 * j}" * min(j, 1)
             expected.insert(loc=0, column=col_name, value=[0, 1, 2])
 
         expected[orig_key] = orig_value
@@ -142,7 +138,6 @@ def test_mangled_unnamed_placeholders(all_parsers):
         tm.assert_frame_equal(df, expected)
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
 def test_mangle_dupe_cols_already_exists(all_parsers):
     # GH#14704
     parser = all_parsers
@@ -156,7 +151,6 @@ def test_mangle_dupe_cols_already_exists(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
 def test_mangle_dupe_cols_already_exists_unnamed_col(all_parsers):
     # GH#14704
     parser = all_parsers

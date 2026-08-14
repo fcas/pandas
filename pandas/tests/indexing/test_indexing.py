@@ -8,8 +8,6 @@ import weakref
 import numpy as np
 import pytest
 
-from pandas._config import using_pyarrow_string_dtype
-
 from pandas.errors import IndexingError
 
 from pandas.core.dtypes.common import (
@@ -123,20 +121,14 @@ class TestFancy:
         idxr = indexer_sli(obj)
         nd3 = np.random.default_rng(2).integers(5, size=(2, 2, 2))
 
+        err = ValueError
         if indexer_sli is tm.iloc:
-            err = ValueError
             msg = f"Cannot set values with ndim > {obj.ndim}"
+        elif indexer_sli is tm.setitem and frame_or_series is DataFrame:
+            # __setitem__ with a 3D key treats it as a boolean mask
+            msg = "Array conditional must be same shape as self"
         else:
-            err = ValueError
-            msg = "|".join(
-                [
-                    r"Buffer has wrong number of dimensions \(expected 1, got 3\)",
-                    "Cannot set values with ndim > 1",
-                    "Index data must be 1-dimensional",
-                    "Data must be 1-dimensional",
-                    "Array conditional must be same shape as self",
-                ]
-            )
+            msg = "Index data must be 1-dimensional"
 
         with pytest.raises(err, match=msg):
             idxr[nd3] = 0
@@ -180,14 +172,8 @@ class TestFancy:
         df["c"] = np.nan
         assert df["c"].dtype == np.float64
 
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             df.loc[0, "c"] = "foo"
-        expected = DataFrame(
-            {"a": [1, 3], "b": [np.nan, 2], "c": Series(["foo", np.nan], dtype=object)}
-        )
-        tm.assert_frame_equal(df, expected)
 
     @pytest.mark.parametrize("val", [3.14, "wxyz"])
     def test_setitem_dtype_upcast2(self, val):
@@ -199,19 +185,8 @@ class TestFancy:
         )
 
         left = df.copy()
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             left.loc["a", "bar"] = val
-        right = DataFrame(
-            [[0, val, 2], [3, 4, 5]],
-            index=list("ab"),
-            columns=["foo", "bar", "baz"],
-        )
-
-        tm.assert_frame_equal(left, right)
-        assert is_integer_dtype(left["foo"])
-        assert is_integer_dtype(left["baz"])
 
     def test_setitem_dtype_upcast3(self):
         left = DataFrame(
@@ -219,20 +194,8 @@ class TestFancy:
             index=list("ab"),
             columns=["foo", "bar", "baz"],
         )
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             left.loc["a", "bar"] = "wxyz"
-
-        right = DataFrame(
-            [[0, "wxyz", 0.2], [0.3, 0.4, 0.5]],
-            index=list("ab"),
-            columns=["foo", "bar", "baz"],
-        )
-
-        tm.assert_frame_equal(left, right)
-        assert is_float_dtype(left["foo"])
-        assert is_float_dtype(left["baz"])
 
     def test_dups_fancy_indexing(self):
         # GH 3455
@@ -288,7 +251,7 @@ class TestFancy:
             with pytest.raises(
                 KeyError,
                 match=re.escape(
-                    "\"None of [Index(['E'], dtype='string')] are in the [index]\""
+                    "\"None of [Index(['E'], dtype='str')] are in the [index]\""
                 ),
             ):
                 dfnu.loc[["E"]]
@@ -370,7 +333,7 @@ class TestFancy:
     def test_multitype_list_index_access(self):
         # GH 10610
         df = DataFrame(
-            np.random.default_rng(2).random((10, 5)), columns=["a"] + [20, 21, 22, 23]
+            np.random.default_rng(2).random((10, 5)), columns=["a", 20, 21, 22, 23]
         )
 
         with pytest.raises(KeyError, match=re.escape("'[26, -8] not in index'")):
@@ -455,9 +418,6 @@ class TestFancy:
         )
         tm.assert_frame_equal(result, df)
 
-    @pytest.mark.xfail(
-        using_pyarrow_string_dtype(), reason="can't multiply arrow strings"
-    )
     def test_multi_assign(self):
         # GH 3626, an assignment of a sub-df to a df
         # set float64 to avoid upcast when setting nan
@@ -565,6 +525,7 @@ class TestFancy:
         df_orig = DataFrame(
             [["1", "2", "3", ".4", 5, 6.0, "foo"]], columns=list("ABCDEFG")
         )
+        df_orig[list("ABCDG")] = df_orig[list("ABCDG")].astype(object)
 
         df = df_orig.copy()
 
@@ -574,9 +535,9 @@ class TestFancy:
         expected = DataFrame(
             [[1, 2, "3", ".4", 5, 6.0, "foo"]], columns=list("ABCDEFG")
         )
-        if not using_infer_string:
-            expected["A"] = expected["A"].astype(object)
-            expected["B"] = expected["B"].astype(object)
+        expected[list("CDG")] = expected[list("CDG")].astype(object)
+        expected["A"] = expected["A"].astype(object)
+        expected["B"] = expected["B"].astype(object)
         tm.assert_frame_equal(df, expected)
 
         # GH5702 (loc)
@@ -585,18 +546,16 @@ class TestFancy:
         expected = DataFrame(
             [[1, "2", "3", ".4", 5, 6.0, "foo"]], columns=list("ABCDEFG")
         )
-        if not using_infer_string:
-            expected["A"] = expected["A"].astype(object)
+        expected[list("ABCDG")] = expected[list("ABCDG")].astype(object)
         tm.assert_frame_equal(df, expected)
 
         df = df_orig.copy()
+
         df.loc[:, ["B", "C"]] = df.loc[:, ["B", "C"]].astype(np.int64)
         expected = DataFrame(
             [["1", 2, 3, ".4", 5, 6.0, "foo"]], columns=list("ABCDEFG")
         )
-        if not using_infer_string:
-            expected["B"] = expected["B"].astype(object)
-            expected["C"] = expected["C"].astype(object)
+        expected[list("ABCDG")] = expected[list("ABCDG")].astype(object)
         tm.assert_frame_equal(df, expected)
 
     def test_astype_assignment_full_replacements(self):
@@ -611,6 +570,58 @@ class TestFancy:
 
         df = DataFrame({"A": [1.0, 2.0, 3.0, 4.0]})
         df.loc[:, "A"] = df["A"].astype(np.int64)
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "dtype, ea_dtype",
+        [
+            ("float64", "Int64"),
+            ("float64", "Float64"),
+            ("bool", "boolean"),
+        ],
+    )
+    @pytest.mark.parametrize("box", [Series, Index])
+    def test_iloc_setitem_ea_dtype_series(self, dtype, ea_dtype, box):
+        # GH#47776
+        if dtype == "bool":
+            df = DataFrame({"A": [True, False, True]})
+            val = box([False, True, False], dtype=ea_dtype)
+        else:
+            df = DataFrame({"A": [1.0, 2.0, 3.0]})
+            val = box([4, 5, 6], dtype=ea_dtype)
+
+        df.iloc[:, 0] = val
+        expected = DataFrame({"A": val.to_numpy(dtype=dtype)})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "col_dtype, ea_dtype, bad_value, good_value",
+        [
+            ("uint64", "Int64", -1, 5),
+            ("uint64", "int64[pyarrow]", -1, 5),
+            ("float32", "Float64", 1e300, 5.0),
+            ("float32", "double[pyarrow]", 1e300, 5.0),
+        ],
+    )
+    @pytest.mark.parametrize("box", [Series, Index])
+    def test_iloc_setitem_ea_dtype_lossy_raises(
+        self, col_dtype, ea_dtype, bad_value, good_value, box
+    ):
+        # GH#47776 - a NA-free nullable/arrow EA whose values don't fit the
+        #  target numpy dtype must raise, not silently wrap (-1 -> 2**64-1) or
+        #  overflow (1e300 -> inf).
+        if "pyarrow" in ea_dtype:
+            pytest.importorskip("pyarrow")
+
+        df = DataFrame({"A": np.zeros(3, dtype=col_dtype)})
+        lossy = box([bad_value, good_value, good_value], dtype=ea_dtype)
+        with pytest.raises(TypeError, match="Invalid value"):
+            df.iloc[:, 0] = lossy
+
+        # a value that does fit is still assigned inplace, retaining the dtype
+        fits = box([good_value, good_value, good_value], dtype=ea_dtype)
+        df.iloc[:, 0] = fits
+        expected = DataFrame({"A": fits.to_numpy(dtype=col_dtype)})
         tm.assert_frame_equal(df, expected)
 
     @pytest.mark.parametrize("indexer", [tm.getitem, tm.loc])
@@ -634,7 +645,7 @@ class TestFancy:
             indexer(s2)[0.0] = 0
             exp = s.index
             if 0 not in s:
-                exp = Index(s.index.tolist() + [0])
+                exp = Index([*s.index.tolist(), 0])
             tm.assert_index_equal(s2.index, exp)
 
             s2 = s.copy()
@@ -683,7 +694,6 @@ class TestMisc:
         df.loc[df.index] = df.loc[df.index]
         tm.assert_frame_equal(df, df2)
 
-    @pytest.mark.xfail(using_pyarrow_string_dtype(), reason="can't set int into string")
     def test_rhs_alignment(self):
         # GH8258, tests that both rows & columns are aligned to what is
         # assigned to. covers both uniform data-type & multi-type cases
@@ -708,7 +718,7 @@ class TestMisc:
         cols = ["jim", "joe", "jolie", "joline"]
         df = DataFrame(xs, columns=cols, index=list("abcde"), dtype="int64")
 
-        # right hand side; permute the indices and multiplpy by -2
+        # right hand side; permute the indices and multiply by -2
         rhs = -2 * df.iloc[3:0:-1, 2:0:-1]
 
         # expected `right` result; just multiply by -2
@@ -728,7 +738,7 @@ class TestMisc:
             frame["jolie"] = frame["jolie"].map(lambda x: f"@{x}")
         right_iloc["joe"] = [1.0, "@-28", "@-20", "@-12", 17.0]
         right_iloc["jolie"] = ["@2", -26.0, -18.0, -10.0, "@18"]
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        with pytest.raises(TypeError, match="Invalid value"):
             run_tests(df, rhs, right_loc, right_iloc)
 
     @pytest.mark.parametrize(
@@ -780,10 +790,10 @@ class TestMisc:
         # GH 11652
         s = Series(index=range(size), dtype=np.float64)
         s.loc[range(1)] = 42
-        tm.assert_series_equal(s.loc[range(1)], Series(42.0, index=[0]))
+        tm.assert_series_equal(s.loc[range(1)], Series(42.0, index=range(1)))
 
         s.loc[range(2)] = 43
-        tm.assert_series_equal(s.loc[range(2)], Series(43.0, index=[0, 1]))
+        tm.assert_series_equal(s.loc[range(2)], Series(43.0, index=range(2)))
 
     def test_partial_boolean_frame_indexing(self):
         # GH 17170
@@ -796,6 +806,27 @@ class TestMisc:
             np.array([[0.0, 1.0, np.nan], [3.0, 4.0, np.nan], [np.nan] * 3]),
             index=list("abc"),
             columns=list("ABC"),
+        )
+        tm.assert_frame_equal(result, expected)
+
+    def test_period_column_slicing(self):
+        # GH#60273 The transpose operation creates a single 5x1 block of PeriodDtype
+        # Make sure it is reindexed correctly
+        df = DataFrame(
+            pd.period_range("2021-01-01", periods=5, freq="D"),
+            columns=["A"],
+        ).T
+        result = df[[0, 1, 2]]
+        expected = DataFrame(
+            [
+                [
+                    pd.Period("2021-01-01", freq="D"),
+                    pd.Period("2021-01-02", freq="D"),
+                    pd.Period("2021-01-03", freq="D"),
+                ]
+            ],
+            index=["A"],
+            columns=[0, 1, 2],
         )
         tm.assert_frame_equal(result, expected)
 
@@ -1049,24 +1080,22 @@ def test_ser_list_indexer_exceeds_dimensions(indexer_li):
 def test_scalar_setitem_with_nested_value(value):
     # For numeric data, we try to unpack and thus raise for mismatching length
     df = DataFrame({"A": [1, 2, 3]})
-    msg = "|".join(
-        [
-            "Must have equal len keys and value",
-            "setting an array element with a sequence",
-        ]
-    )
+    # NumPy rejects the nested value while building the column
+    msg = "setting an array element with a sequence"
     with pytest.raises(ValueError, match=msg):
         df.loc[0, "B"] = value
 
-    # TODO For object dtype this happens as well, but should we rather preserve
-    # the nested data and set as such?
+    # Update for object dtype: We DO preserve nested data now (Fixes #57962)
     df = DataFrame({"A": [1, 2, 3], "B": np.array([1, "a", "b"], dtype=object)})
-    with pytest.raises(ValueError, match="Must have equal len keys and value"):
-        df.loc[0, "B"] = value
-    # if isinstance(value, np.ndarray):
-    #     assert (df.loc[0, "B"] == value).all()
-    # else:
-    #     assert df.loc[0, "B"] == value
+
+    # Perform the assignment (this used to be inside the pytest.raises block)
+    df.loc[0, "B"] = value
+
+    # Use the author's original intended assertions
+    if isinstance(value, np.ndarray):
+        assert (df.loc[0, "B"] == value).all()
+    else:
+        assert df.loc[0, "B"] == value
 
 
 @pytest.mark.parametrize(
@@ -1133,6 +1162,53 @@ def test_scalar_setitem_series_with_nested_value_length1(value, indexer_sli):
         assert (ser.loc[0] == value).all()
     else:
         assert ser.loc[0] == value
+
+
+def test_scalar_setitem_tuple_into_object_column():
+    # GH#26333 - assigning a tuple to a single cell of an object-dtype column
+    #  that already holds tuples should store it as-is, not raise on length
+    df = DataFrame({"a": [1, 2, 3], "b": [(1, 2), (1, 2, 3), (3, 4)]})
+
+    df.loc[0, "b"] = (7, 8, 9)
+    assert df.loc[0, "b"] == (7, 8, 9)
+
+    # .at takes the same path
+    df.at[1, "b"] = (4, 5)
+    assert df.at[1, "b"] == (4, 5)
+
+    expected = DataFrame({"a": [1, 2, 3], "b": [(7, 8, 9), (4, 5), (3, 4)]})
+    tm.assert_frame_equal(df, expected)
+
+
+def test_loc_setitem_list_of_tuples_on_object_column():
+    # GH#37629 - assigning list of tuples to object-dtype column
+    # with a boolean mask on a mixed-dtype DataFrame
+    df = DataFrame({"a": [1, 1, 2, 1], "b": [(1, 1, 0)] * 4})
+
+    # list of tuples matching selected row count
+    df.loc[df["a"] == 1, "b"] = [(0, 0, 1), (0, 0, 1), (0, 0, 1)]
+    expected = DataFrame(
+        {"a": [1, 1, 2, 1], "b": [(0, 0, 1), (0, 0, 1), (1, 1, 0), (0, 0, 1)]}
+    )
+    tm.assert_frame_equal(df, expected)
+    # verify tuples are preserved as tuples
+    assert isinstance(df["b"].iloc[0], tuple)
+
+    # doubly-nested list: [[(tuple)]] treated as 2D with 1 row x 1 col,
+    # tuple value broadcast to all matching rows
+    df2 = DataFrame({"a": [1, 1, 2, 1], "b": [(1, 1, 0)] * 4})
+    df2.loc[df2["a"] == 1, "b"] = [[(0, 0, 1)]]
+    tm.assert_frame_equal(df2, expected)
+
+
+@pytest.mark.parametrize("value", [[[1, 2], [3, 4], [5, 6]], [(1, 2), (3, 4), (5, 6)]])
+def test_loc_setitem_2d_list_on_object_frame(value):
+    # GH#65264 - a list of lists/tuples assigned to a 2D object block is a
+    # genuine 2D value; its rows must not be wrapped into single object cells
+    df = DataFrame({"a": [10, 20, 30], "b": [40, 50, 60]}, dtype=object)
+    df.loc[:, :] = value
+    expected = DataFrame({"a": [1, 3, 5], "b": [2, 4, 6]}, dtype=object)
+    tm.assert_frame_equal(df, expected)
 
 
 def test_object_dtype_series_set_series_element():

@@ -106,7 +106,7 @@ def test_integer_overflow_bug(all_parsers, sep):
     data = "65248E10 11\n55555E55 22\n"
     parser = all_parsers
     if parser.engine == "pyarrow" and sep != " ":
-        msg = "the 'pyarrow' engine does not support regex separators"
+        msg = "the 'pyarrow' engine does not support separators > 1 char"
         with pytest.raises(ValueError, match=msg):
             parser.read_csv(StringIO(data), header=None, sep=sep)
         return
@@ -148,13 +148,13 @@ def test_int64_overflow(all_parsers, conv, request):
         result = parser.read_csv(StringIO(data))
         expected = DataFrame(
             [
-                "00013007854817840016671868",
-                "00013007854817840016749251",
-                "00013007854817840016754630",
-                "00013007854817840016781876",
-                "00013007854817840017028824",
-                "00013007854817840017963235",
-                "00013007854817840018860166",
+                13007854817840016671868,
+                13007854817840016749251,
+                13007854817840016754630,
+                13007854817840016781876,
+                13007854817840017028824,
+                13007854817840017963235,
+                13007854817840018860166,
             ],
             columns=["ID"],
         )
@@ -185,8 +185,35 @@ def test_int64_overflow(all_parsers, conv, request):
 )
 def test_int64_uint64_range(all_parsers, val):
     # These numbers fall right inside the int64-uint64
-    # range, so they should be parsed as string.
+    # range, so they should be parsed as integer.
     parser = all_parsers
+    result = parser.read_csv(StringIO(str(val)), header=None)
+
+    expected = DataFrame([val])
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow  # CSV parse error: Empty CSV file or block
+@pytest.mark.parametrize(
+    "val",
+    [
+        np.iinfo(np.uint64).max + 1,
+        np.iinfo(np.int64).min - 1,
+        # 20-digit values that exceed uint64 by more than 2**64, so a parser
+        # accumulating into a 64-bit register wraps back into the range of
+        # valid 20-digit values and can miss the overflow (GH#66457)
+        30000000000000000000,
+        47386862472818278521,
+        # 5 * 2**64 - 10, whose residue is 10 below uint64 max and so looks
+        # maximally plausible (GH#66238)
+        92233720368547758070,
+    ],
+)
+def test_outside_int64_uint64_range(all_parsers, val, request):
+    # These numbers fall just outside the int64-uint64
+    # range, so they should be parsed as object.
+    parser = all_parsers
+
     result = parser.read_csv(StringIO(str(val)), header=None)
 
     expected = DataFrame([val])
@@ -197,13 +224,12 @@ def test_int64_uint64_range(all_parsers, val):
 @pytest.mark.parametrize(
     "val", [np.iinfo(np.uint64).max + 1, np.iinfo(np.int64).min - 1]
 )
-def test_outside_int64_uint64_range(all_parsers, val):
-    # These numbers fall just outside the int64-uint64
-    # range, so they should be parsed as string.
+def test_outside_int64_uint64_range_follow_str(all_parsers, val):
     parser = all_parsers
-    result = parser.read_csv(StringIO(str(val)), header=None)
 
-    expected = DataFrame([str(val)])
+    result = parser.read_csv(StringIO(f"{val}\nabc"), header=None)
+
+    expected = DataFrame([str(val), "abc"])
     tm.assert_frame_equal(result, expected)
 
 
@@ -228,3 +254,19 @@ def test_integer_precision(all_parsers):
     result = parser.read_csv(StringIO(s), header=None)[4]
     expected = Series([4321583677327450765, 4321113141090630389], name=4)
     tm.assert_series_equal(result, expected)
+
+
+def test_thousands_digit_char(all_parsers):
+    # GH#66487: a digit thousands separator is degenerate but accepted, and
+    # gets stripped like any other separator; the C engine's all-digits
+    # integer fast path must not swallow it
+    parser = all_parsers
+    data = "a\n1000\n"
+    if parser.engine == "pyarrow":
+        msg = "The 'thousands' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(StringIO(data), thousands="0")
+        return
+    result = parser.read_csv(StringIO(data), thousands="0")
+    expected = DataFrame({"a": [1]})
+    tm.assert_frame_equal(result, expected)

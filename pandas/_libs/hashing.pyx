@@ -21,6 +21,7 @@ import_array()
 from pandas._libs.util cimport is_nan
 
 
+@cython.wraparound(False)
 @cython.boundscheck(False)
 def hash_object_array(
     ndarray[object, ndim=1] arr, str key, str encoding="utf8"
@@ -91,6 +92,8 @@ def hash_object_array(
             hash(val)
             data = <bytes>str(val).encode(encoding)
         else:
+            free(vecs)
+            free(lens)
             raise TypeError(
                 f"{val} of type {type(val)} is not a valid type for hashing, "
                 "must be string or null"
@@ -158,7 +161,7 @@ cdef uint64_t low_level_siphash(uint8_t* data, size_t datalen,
     cdef uint64_t k0 = u8to64_le(key)
     cdef uint64_t k1 = u8to64_le(key + 8)
     cdef uint64_t m
-    cdef int i
+    cdef int i, _
     cdef uint8_t* end = data + datalen - (datalen % sizeof(uint64_t))
     cdef int left = datalen & 7
     cdef int cROUNDS = 2
@@ -173,7 +176,7 @@ cdef uint64_t low_level_siphash(uint8_t* data, size_t datalen,
     while (data != end):
         m = u8to64_le(data)
         v3 ^= m
-        for i in range(cROUNDS):
+        for _ in range(cROUNDS):
             _sipround(&v0, &v1, &v2, &v3)
         v0 ^= m
 
@@ -184,13 +187,13 @@ cdef uint64_t low_level_siphash(uint8_t* data, size_t datalen,
 
     v3 ^= b
 
-    for i in range(cROUNDS):
+    for _ in range(cROUNDS):
         _sipround(&v0, &v1, &v2, &v3)
 
     v0 ^= b
     v2 ^= 0xff
 
-    for i in range(dROUNDS):
+    for _ in range(dROUNDS):
         _sipround(&v0, &v1, &v2, &v3)
 
     b = v0 ^ v1 ^ v2 ^ v3

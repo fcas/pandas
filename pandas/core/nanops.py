@@ -3,15 +3,16 @@ from __future__ import annotations
 import functools
 import itertools
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Callable,
+    Literal,
     cast,
 )
 import warnings
 
 import numpy as np
 
-from pandas._config import get_option
+from pandas._config.config import _global_config as config
 
 from pandas._libs import (
     NaT,
@@ -19,20 +20,12 @@ from pandas._libs import (
     iNaT,
     lib,
 )
-from pandas._typing import (
-    ArrayLike,
-    AxisInt,
-    CorrelationMethod,
-    Dtype,
-    DtypeObj,
-    F,
-    Scalar,
-    Shape,
-    npt,
-)
+import pandas._libs.algos as libalgos
+from pandas._libs.tslibs import OutOfBoundsTimedelta
 from pandas.compat._optional import import_optional_dependency
 
 from pandas.core.dtypes.common import (
+    ensure_float64,
     is_complex,
     is_float,
     is_float_dtype,
@@ -48,6 +41,21 @@ from pandas.core.dtypes.missing import (
     notna,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pandas._typing import (
+        ArrayLike,
+        AxisInt,
+        CorrelationMethod,
+        Dtype,
+        DtypeObj,
+        F,
+        Scalar,
+        Shape,
+        npt,
+    )
+
 bn = import_optional_dependency("bottleneck", errors="warn")
 _BOTTLENECK_INSTALLED = bn is not None
 _USE_BOTTLENECK = False
@@ -60,7 +68,7 @@ def set_use_bottleneck(v: bool = True) -> None:
         _USE_BOTTLENECK = v
 
 
-set_use_bottleneck(get_option("compute.use_bottleneck"))
+set_use_bottleneck(config["compute"]["use_bottleneck"])
 
 
 class disallow:
@@ -91,7 +99,7 @@ class disallow:
                     raise TypeError(e) from e
                 raise
 
-        return cast(F, _f)
+        return cast("F", _f)
 
 
 class bottleneck_switch:
@@ -134,7 +142,7 @@ class bottleneck_switch:
                     # `mask` is not recognised by bottleneck, would raise
                     #  TypeError if called
                     kwds.pop("mask", None)
-                    result = bn_func(values, axis=axis, **kwds)
+                    result = bn_func(values, axis=axis, **kwds)  # pyright: ignore[reportOptionalCall]
 
                     # prefer to treat inf/-inf as NA, but must compute the func
                     # twice :(
@@ -147,11 +155,11 @@ class bottleneck_switch:
 
             return result
 
-        return cast(F, f)
+        return cast("F", f)
 
 
 def _bn_ok_dtype(dtype: DtypeObj, name: str) -> bool:
-    # Bottleneck chokes on datetime64, PeriodDtype (or and EA)
+    # Bottleneck chokes on datetime64, PeriodDtype (or an EA)
     if dtype != object and not needs_i8_conversion(dtype):
         # GH 42878
         # Bottleneck uses naive summation leading to O(n) loss of precision
@@ -173,7 +181,7 @@ def _bn_ok_dtype(dtype: DtypeObj, name: str) -> bool:
 def _has_infs(result) -> bool:
     if isinstance(result, np.ndarray):
         if result.dtype in ("f8", "f4"):
-            # Note: outside of an nanops-specific test, we always have
+            # Note: outside of a nanops-specific test, we always have
             #  result.ndim == 1, so there is no risk of this ravel making a copy.
             return lib.has_infs(result.ravel("K"))
     try:
@@ -192,17 +200,27 @@ def _get_fill_value(
     if _na_ok_dtype(dtype):
         if fill_value_typ is None:
             return np.nan
+        elif fill_value_typ == "+inf":
+            return np.inf
         else:
-            if fill_value_typ == "+inf":
-                return np.inf
-            else:
-                return -np.inf
-    else:
+            return -np.inf
+    elif dtype.kind == "u":
+        # Unsigned ints: use a uint64 sentinel so np.where keeps the values
+        # unsigned.  An int64 fill would force a uint64/int64 mix to promote to
+        # float64, losing precision for values above 2**53 and giving the wrong
+        # idxmin/idxmax/min/max (GH#64478).  u8max/0 also bracket the full
+        # uint64 range, unlike i8max which real values can exceed.
         if fill_value_typ == "+inf":
-            # need the max int here
-            return lib.i8max
-        else:
-            return iNaT
+            return np.uint64(lib.u8max)
+        return np.uint64(0)
+    elif fill_value_typ == "+inf":
+        # need the max int here
+        # Return as np.int64 so that np.where promotes the dtype
+        # instead of raising OverflowError (numpy 2.5+) when the
+        # value doesn't fit in the array's dtype (e.g. int8).
+        return np.int64(lib.i8max)
+    else:
+        return np.int64(iNaT)
 
 
 def _maybe_get_mask(
@@ -338,7 +356,7 @@ def _na_ok_dtype(dtype: DtypeObj) -> bool:
     return not issubclass(dtype.type, np.integer)
 
 
-def _wrap_results(result, dtype: np.dtype, fill_value=None):
+def _wrap_results(result, dtype: np.dtype, fill_value=None, result_mask=None):
     """wrap our results if needed"""
     if result is NaT:
         pass
@@ -363,17 +381,27 @@ def _wrap_results(result, dtype: np.dtype, fill_value=None):
             result = result.astype(dtype)
     elif dtype.kind == "m":
         if not isinstance(result, np.ndarray):
-            if result == fill_value or np.isnan(result):
-                result = np.timedelta64("NaT").astype(dtype)
+            if result_mask or result == fill_value or np.isnan(result):
+                unit = np.datetime_data(dtype)[0]
+                result = np.timedelta64("NaT", unit)  # type: ignore[call-overload]
 
             elif np.fabs(result) > lib.i8max:
-                # raise if we have a timedelta64[ns] which is too large
-                raise ValueError("overflow in timedelta operation")
+                # GH#43178: raise if the result is too large for the dtype's unit
+                raise OutOfBoundsTimedelta("overflow in timedelta operation")
             else:
                 # return a timedelta64 with the original unit
                 result = np.int64(result).astype(dtype, copy=False)
 
         else:
+            overflow = np.abs(result) > lib.i8max
+            if result_mask is not None:
+                # GH#43178: positions that will be set to NaT (skipna=False) are
+                #  exempt from the overflow check and must not trip the cast below
+                overflow &= ~result_mask
+                result = np.where(result_mask, 0, result)
+            if overflow.any():
+                # GH#43178: raise if any result is too large for the dtype's unit
+                raise OutOfBoundsTimedelta("overflow in timedelta operation")
             result = result.astype("m8[ns]").view(dtype)
 
     return result
@@ -403,14 +431,25 @@ def _datetimelike_compat(func: F) -> F:
         result = func(values, axis=axis, skipna=skipna, mask=mask, **kwargs)
 
         if datetimelike:
-            result = _wrap_results(result, orig_values.dtype, fill_value=iNaT)
+            result_mask = None
+            if not skipna:
+                assert mask is not None  # checked above
+                # positions with any NA reduce to NaT, so exempt them from the
+                # timedelta overflow guard in _wrap_results
+                if isinstance(result, np.ndarray):
+                    result_mask = mask.any(axis=axis)
+                else:
+                    result_mask = mask.any()
+            result = _wrap_results(
+                result, orig_values.dtype, fill_value=iNaT, result_mask=result_mask
+            )
             if not skipna:
                 assert mask is not None  # checked above
                 result = _mask_datetimelike_result(result, axis, mask, orig_values)
 
         return result
 
-    return cast(F, new_func)
+    return cast("F", new_func)
 
 
 def _na_for_min_count(values: np.ndarray, axis: AxisInt | None) -> Scalar | np.ndarray:
@@ -460,8 +499,7 @@ def maybe_operate_rowwise(func: F) -> F:
             # only takes this path for wide arrays (long dataframes), for threshold see
             # https://github.com/pandas-dev/pandas/pull/43311#issuecomment-974891737
             and (values.shape[1] / 1000) > values.shape[0]
-            and values.dtype != object
-            and values.dtype != bool
+            and values.dtype not in (object, bool)
         ):
             arrs = list(values)
             if kwargs.get("mask") is not None:
@@ -475,7 +513,7 @@ def maybe_operate_rowwise(func: F) -> F:
 
         return func(values, axis=axis, **kwargs)
 
-    return cast(F, newfunc)
+    return cast("F", newfunc)
 
 
 def nanany(
@@ -505,12 +543,12 @@ def nanany(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 2])
     >>> nanops.nanany(s.values)
-    True
+    np.True_
 
     >>> from pandas.core import nanops
     >>> s = pd.Series([np.nan])
     >>> nanops.nanany(s.values)
-    False
+    np.False_
     """
     if values.dtype.kind in "iub" and mask is None:
         # GH#26032 fastpath
@@ -561,12 +599,12 @@ def nanall(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 2, np.nan])
     >>> nanops.nanall(s.values)
-    True
+    np.True_
 
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 0])
     >>> nanops.nanall(s.values)
-    False
+    np.False_
     """
     if values.dtype.kind in "iub" and mask is None:
         # GH#26032 fastpath
@@ -600,7 +638,7 @@ def nansum(
     skipna: bool = True,
     min_count: int = 0,
     mask: npt.NDArray[np.bool_] | None = None,
-) -> float:
+) -> np.ndarray | np.int64 | float | NaTType:
     """
     Sum the elements along an axis ignoring NaNs
 
@@ -622,20 +660,133 @@ def nansum(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 2, np.nan])
     >>> nanops.nansum(s.values)
-    3.0
+    np.float64(3.0)
     """
     dtype = values.dtype
-    values, mask = _get_values(values, skipna, fill_value=0, mask=mask)
+    if dtype == object and not skipna:
+        if mask is None:
+            mask = isna(values)
+        if mask.any():
+            # GH#4147: an object NA that supports addition propagates on its
+            # own and carries more type information than a bare nan would
+            # (pd.NA, Decimal("NaN"), NaT), so prefer it.  Step in only when it
+            # does not, e.g. None, or values that cannot be added at all.
+            try:
+                the_sum = values.sum(axis, dtype=_get_dtype_max(dtype))
+            except TypeError:
+                pass
+            else:
+                return _maybe_null_out(
+                    the_sum, axis, mask, values.shape, min_count=min_count
+                )
+            if values.ndim == 1 or axis is None:
+                # error: Incompatible return value type (got "Union[Scalar,
+                # ndarray]", expected "Union[ndarray, float, NaTType]")
+                return _na_for_min_count(values, axis)  # type: ignore[return-value]
+            values = _blank_object_na_slices(values, mask, axis, 0)
+            min_count = _na_min_count(values, axis, min_count)
+    else:
+        values, mask = _get_values(values, skipna, fill_value=0, mask=mask)
     dtype_sum = _get_dtype_max(dtype)
     if dtype.kind == "f":
-        dtype_sum = dtype
+        # GH#43929 float16 sum overflows easily; upcast like numpy does
+        dtype_sum = np.dtype(np.float64) if dtype == np.float16 else dtype
     elif dtype.kind == "m":
-        dtype_sum = np.dtype(np.float64)
+        # GH#66551 float64 has a 53-bit mantissa, so accumulating i8 values there
+        #  silently rounds the result; sum in int64 instead.
+        the_sum = _sum_timedelta_i8(values, axis, mask, skipna, min_count)
+        return _maybe_null_out(
+            the_sum, axis, mask, values.shape, min_count=min_count, datetimelike=True
+        )
 
     the_sum = values.sum(axis, dtype=dtype_sum)
     the_sum = _maybe_null_out(the_sum, axis, mask, values.shape, min_count=min_count)
 
     return the_sum
+
+
+def _sum_timedelta_i8(
+    values: np.ndarray,
+    axis: AxisInt | None,
+    mask: npt.NDArray[np.bool_] | None,
+    skipna: bool,
+    min_count: int,
+) -> np.ndarray | np.int64:
+    """
+    Sum i8-viewed timedelta64 values exactly, raising on a result that does not
+    fit in int64.
+
+    int64 addition is modular, so an intermediate that leaves the range does not
+    corrupt the total; only the total itself has to be checked.  Values are
+    summed in blocks short enough that each block sum provably stays in range,
+    and the block sums are then combined in Python ints.
+
+    Parameters
+    ----------
+    values : ndarray[int64]
+    axis : int, optional
+    mask : ndarray[bool], optional
+    skipna : bool
+    min_count : int
+
+    Returns
+    -------
+    int64 scalar or ndarray[int64]
+
+    Raises
+    ------
+    OutOfBoundsTimedelta
+        If the exact sum is not representable as a timedelta64, i.e. it lands
+        outside (iNaT, i8max].
+    """
+    # Results that get discarded downstream are exempt from the bounds check:
+    #  positions that reduce to NaT under skipna=False, as in _wrap_results, and
+    #  positions that min_count nulls out in _maybe_null_out.
+    exempt: np.ndarray | np.bool_ = np.False_
+    if not skipna and mask is not None:
+        exempt = mask.any(axis=axis)
+    if min_count > 0:
+        if axis is not None and values.ndim > 1:
+            counts = values.shape[axis] - (0 if mask is None else mask.sum(axis))
+            exempt = exempt | (counts < min_count)
+        else:
+            exempt = exempt | check_below_min_count(values.shape, mask, min_count)
+
+    if not skipna and mask is not None and mask.any():
+        # These positions reduce to NaT regardless of what they sum to, so keep
+        #  their raw iNaT out of the accumulator.
+        values = np.where(mask, 0, values)
+
+    if values.size == 0:
+        return values.sum(axis, dtype=np.int64)
+
+    reduce_axis: AxisInt = 0
+    if axis is None:
+        values = values.ravel()
+    else:
+        reduce_axis = axis
+
+    length = values.shape[reduce_axis]
+    largest = max(abs(int(values.min())), abs(int(values.max())))
+    block = lib.i8max // largest if largest else length
+
+    if block >= length:
+        # Every partial sum is bounded by length * largest <= i8max, so the
+        #  int64 sum is exact and in range.
+        return values.sum(reduce_axis, dtype=np.int64)
+
+    starts = np.arange(0, length, block)
+    block_sums = np.add.reduceat(values, starts, axis=reduce_axis)
+    total = block_sums.sum(reduce_axis, dtype=object)
+
+    out_of_range = (total <= iNaT) | (total > lib.i8max)
+    if np.any(out_of_range & ~exempt):
+        raise OutOfBoundsTimedelta("overflow in timedelta operation")
+
+    if isinstance(total, np.ndarray):
+        # anything still out of range here is exempt, i.e. is discarded anyway
+        return np.where(out_of_range, 0, total).astype(np.int64)
+    return np.int64(0 if out_of_range else total)
 
 
 def _mask_datetimelike_result(
@@ -648,12 +799,9 @@ def _mask_datetimelike_result(
         # we need to apply the mask
         result = result.astype("i8").view(orig_values.dtype)
         axis_mask = mask.any(axis=axis)
-        # error: Unsupported target for indexed assignment ("Union[ndarray[Any, Any],
-        # datetime64, timedelta64]")
-        result[axis_mask] = iNaT  # type: ignore[index]
-    else:
-        if mask.any():
-            return np.int64(iNaT).view(orig_values.dtype)
+        result[axis_mask] = iNaT
+    elif mask.any():
+        return np.int64(iNaT).view(orig_values.dtype)
     return result
 
 
@@ -688,8 +836,12 @@ def nanmean(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 2, np.nan])
     >>> nanops.nanmean(s.values)
-    1.5
+    np.float64(1.5)
     """
+    if values.dtype == object and len(values) > 1_000 and mask is None:
+        # GH#54754 if we are going to fail, try to fail-fast
+        nanmean(values[:1000], axis=axis, skipna=skipna)
+
     dtype = values.dtype
     values, mask = _get_values(values, skipna, fill_value=0, mask=mask)
     dtype_sum = _get_dtype_max(dtype)
@@ -701,7 +853,8 @@ def nanmean(
     elif dtype.kind in "iu":
         dtype_sum = np.dtype(np.float64)
     elif dtype.kind == "f":
-        dtype_sum = dtype
+        # GH#43929 float16 sum overflows easily; upcast like numpy does
+        dtype_sum = np.dtype(np.float64) if dtype == np.float16 else dtype
         dtype_count = dtype
 
     count = _get_counts(values.shape, mask, axis, dtype=dtype_count)
@@ -709,7 +862,7 @@ def nanmean(
     the_sum = _ensure_numeric(the_sum)
 
     if axis is not None and getattr(the_sum, "ndim", False):
-        count = cast(np.ndarray, count)
+        count = cast("np.ndarray", count)
         with np.errstate(all="ignore"):
             # suppress division by zero warnings
             the_mean = the_sum / count
@@ -723,7 +876,9 @@ def nanmean(
 
 
 @bottleneck_switch()
-def nanmedian(values, *, axis: AxisInt | None = None, skipna: bool = True, mask=None):
+def nanmedian(
+    values: np.ndarray, *, axis: AxisInt | None = None, skipna: bool = True, mask=None
+) -> float | np.ndarray:
     """
     Parameters
     ----------
@@ -735,7 +890,7 @@ def nanmedian(values, *, axis: AxisInt | None = None, skipna: bool = True, mask=
 
     Returns
     -------
-    result : float
+    result : float | ndarray
         Unless input is a float array, in which case use the same
         precision as the input array.
 
@@ -755,7 +910,7 @@ def nanmedian(values, *, axis: AxisInt | None = None, skipna: bool = True, mask=
     # cases we never need to set NaN to the masked values
     using_nan_sentinel = values.dtype.kind == "f" and mask is None
 
-    def get_median(x, _mask=None):
+    def get_median(x: np.ndarray, _mask=None):
         if _mask is None:
             _mask = notna(x)
         else:
@@ -790,6 +945,8 @@ def nanmedian(values, *, axis: AxisInt | None = None, skipna: bool = True, mask=
         values[mask] = np.nan
 
     notempty = values.size
+
+    res: float | np.ndarray
 
     # an array from a frame
     if values.ndim > 1 and axis is not None:
@@ -891,7 +1048,7 @@ def _get_counts_nanvar(
             d = np.nan
     else:
         # count is not narrowed by is_float check
-        count = cast(np.ndarray, count)
+        count = cast("np.ndarray", count)
         mask = count <= ddof
         if mask.any():
             np.putmask(d, mask, np.nan)
@@ -935,8 +1092,9 @@ def nanstd(
     >>> nanops.nanstd(s.values)
     1.0
     """
-    if values.dtype == "M8[ns]":
-        values = values.view("m8[ns]")
+    if values.dtype.kind == "M":
+        unit = np.datetime_data(values.dtype)[0]
+        values = values.view(f"m8[{unit}]")
 
     orig_dtype = values.dtype
     values, mask = _get_values(values, skipna, mask=mask)
@@ -988,6 +1146,13 @@ def nanvar(
         values = values.astype("f8")
         if mask is not None:
             values[mask] = np.nan
+    elif dtype.kind == "c":
+        # https://en.wikipedia.org/wiki/Complex_random_variable#Variance_and_pseudo-variance
+        # The variance is equal to the sum of
+        # the variances of the real and imaginary part of the complex random variable.
+        return nanvar(
+            values.real, axis=axis, skipna=skipna, ddof=ddof, mask=mask
+        ) + nanvar(values.imag, axis=axis, skipna=skipna, ddof=ddof, mask=mask)
 
     if values.dtype.kind == "f":
         count, d = _get_counts_nanvar(values.shape, mask, axis, ddof, values.dtype)
@@ -1007,6 +1172,7 @@ def nanvar(
     avg = _ensure_numeric(values.sum(axis=axis, dtype=np.float64)) / count
     if axis is not None:
         avg = np.expand_dims(avg, axis)
+
     sqr = _ensure_numeric((avg - values) ** 2)
     if mask is not None:
         np.putmask(sqr, mask, 0)
@@ -1054,23 +1220,123 @@ def nansem(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, np.nan, 2, 3])
     >>> nanops.nansem(s.values)
-     0.5773502691896258
+     np.float64(0.5773502691896258)
     """
     # This checks if non-numeric-like data is passed with numeric_only=False
     # and raises a TypeError otherwise
     nanvar(values, axis=axis, skipna=skipna, ddof=ddof, mask=mask)
 
     mask = _maybe_get_mask(values, skipna, mask)
-    if values.dtype.kind != "f":
+    # Convert to bottleneck return a float
+    if values.dtype.kind not in "fc":
         values = values.astype("f8")
 
     if not skipna and mask is not None and mask.any():
         return np.nan
 
-    count, _ = _get_counts_nanvar(values.shape, mask, axis, ddof, values.dtype)
+    dtype_count = np.dtype(np.float64)
+    if values.dtype.kind == "f":
+        dtype_count = values.dtype
+    count, _ = _get_counts_nanvar(values.shape, mask, axis, ddof, dtype_count)
     var = nanvar(values, axis=axis, skipna=skipna, ddof=ddof, mask=mask)
 
     return np.sqrt(var) / np.sqrt(count)
+
+
+def _blank_object_na_slices(
+    values: np.ndarray,
+    mask: npt.NDArray[np.bool_],
+    axis: AxisInt,
+    fill_value: Any,
+) -> np.ndarray:
+    """
+    Replace every reduction slice of an object-dtype array that holds an NA
+    with ``fill_value``.
+
+    For ``skipna=False`` those slices are nulled out afterwards, so their values
+    never reach the result and need not even support the operation being applied
+    (GH#4147).  A float NaN propagates through arithmetic and comparison on its
+    own; an object NA does not, and raises instead.
+
+    Only for reductions over an axis of a 2-D array.  When the reduction covers
+    the whole array the result is simply NA, and callers short-circuit instead.
+    """
+    any_na = np.expand_dims(mask.any(axis=axis), axis)
+    return np.where(any_na, fill_value, values)
+
+
+def _na_min_count(values: np.ndarray, axis: AxisInt, min_count: int) -> int:
+    """
+    ``min_count`` that nulls out any slice holding an NA, without weakening an
+    explicit larger ``min_count`` from the caller (GH#4147).
+    """
+    return max(min_count, values.shape[axis])
+
+
+def _fill_object_na(
+    values: np.ndarray,
+    mask: npt.NDArray[np.bool_],
+    axis: AxisInt | None,
+    fill_value: Any,
+) -> np.ndarray:
+    """
+    Replace NA entries in an object-dtype array with a valid value taken from
+    the same reduction slice.
+
+    GH#65500: the +/-inf fill used for other dtypes is not comparable with
+    arbitrary objects (Timestamps, strings, tuples) and raises.  Substituting a
+    value already present in the slice cannot change a min/max, and for
+    argmin/argmax a result landing on a filled position is corrected by
+    ``_maybe_fix_arg_at_na``.  Entirely-NA slices get ``fill_value``, since
+    their result is discarded by the caller either way.
+    """
+    if mask.all():
+        return np.full(values.shape, fill_value, dtype=object)
+    if values.ndim == 1 or axis is None:
+        fill = np.empty(1, dtype=object)
+        # wrap in an array so that e.g. tuple fill values
+        # are not broadcast by np.where
+        fill[0] = values[~mask][0]
+        return np.where(mask, fill, values)
+    indexer = np.expand_dims((~mask).argmax(axis=axis), axis)
+    fill = np.take_along_axis(values, indexer, axis=axis)
+    # argmax selects an NA entry for entirely-NA slices; fill
+    # those with +/-inf instead so the reduction does not warn
+    all_na = np.expand_dims(mask.all(axis=axis), axis)
+    fill = np.where(all_na, fill_value, fill)
+    return np.where(mask, fill, values)
+
+
+def _get_arg_values(
+    values: np.ndarray,
+    *,
+    fill_value_typ: str,
+    mask: npt.NDArray[np.bool_] | None,
+    skipna: bool,
+    axis: AxisInt | None = None,
+) -> tuple[np.ndarray, npt.NDArray[np.bool_] | None]:
+    """
+    Prepare values for nanargmin/nanargmax by filling NA entries so that the
+    comparison does not see them, and raise for ``skipna=False``.
+
+    Mirrors ``_get_values(values, True, ...)`` except for object dtype, where
+    the +/-inf fill is not comparable with arbitrary objects (GH#4147).  The
+    object fill is a same-slice value, which *can* win the comparison; a result
+    landing on it is corrected by ``_maybe_fix_arg_at_na``.
+    """
+    if values.dtype == object:
+        if mask is None:
+            mask = isna(values)
+        if not skipna and mask.any():
+            # _maybe_arg_null_out would raise this once the argmin/argmax is
+            # known, but the comparison must not run first: values in a slice
+            # holding an NA need not be comparable with each other (GH#4147)
+            raise ValueError("Encountered an NA value with skipna=False")
+        if mask.any():
+            fill_value = _get_fill_value(values.dtype, fill_value_typ=fill_value_typ)
+            values = _fill_object_na(values, mask, axis, fill_value)
+        return values, mask
+    return _get_values(values, True, fill_value_typ=fill_value_typ, mask=mask)
 
 
 def _nanminmax(meth, fill_value_typ):
@@ -1086,11 +1352,38 @@ def _nanminmax(meth, fill_value_typ):
         if values.size == 0:
             return _na_for_min_count(values, axis)
 
-        values, mask = _get_values(
-            values, skipna, fill_value_typ=fill_value_typ, mask=mask
-        )
+        dtype = values.dtype
+        min_count = 1
+        if dtype == object:
+            # GH#65500: _get_values' +/-inf fill isn't comparable with arbitrary
+            # objects (Timestamps, strings) and raises; see _fill_object_na.
+            if mask is None:
+                mask = isna(values)
+            if mask.any():
+                fill_value = _get_fill_value(dtype, fill_value_typ=fill_value_typ)
+                if skipna:
+                    values = _fill_object_na(values, mask, axis, fill_value)
+                elif values.ndim == 1 or axis is None:
+                    # GH#4147: an object NA does not propagate through the
+                    # comparison the way a float NaN does, so null out every
+                    # slice that holds one, matching float64/str/dt64.
+                    return _na_for_min_count(values, axis)
+                else:
+                    values = _blank_object_na_slices(values, mask, axis, fill_value)
+                    min_count = _na_min_count(values, axis, min_count)
+        else:
+            values, mask = _get_values(
+                values, skipna, fill_value_typ=fill_value_typ, mask=mask
+            )
         result = getattr(values, meth)(axis)
-        result = _maybe_null_out(result, axis, mask, values.shape)
+        result = _maybe_null_out(
+            result,
+            axis,
+            mask,
+            values.shape,
+            min_count=min_count,
+            datetimelike=dtype.kind in "mM",
+        )
         return result
 
     return reduction
@@ -1126,7 +1419,7 @@ def nanargmax(
     >>> from pandas.core import nanops
     >>> arr = np.array([1, 2, 3, np.nan, 4])
     >>> nanops.nanargmax(arr)
-    4
+    np.int64(4)
 
     >>> arr = np.array(range(12), dtype=np.float64).reshape(4, 3)
     >>> arr[2:, 2] = np.nan
@@ -1138,11 +1431,14 @@ def nanargmax(
     >>> nanops.nanargmax(arr, axis=1)
     array([2, 2, 1, 1])
     """
-    values, mask = _get_values(values, True, fill_value_typ="-inf", mask=mask)
+    values, mask = _get_arg_values(
+        values, fill_value_typ="-inf", mask=mask, skipna=skipna, axis=axis
+    )
     result = values.argmax(axis)
-    # error: Argument 1 to "_maybe_arg_null_out" has incompatible type "Any |
+    # error: Argument 1 to "_maybe_fix_arg_at_na" has incompatible type "Any |
     # signedinteger[Any]"; expected "ndarray[Any, Any]"
-    result = _maybe_arg_null_out(result, axis, mask, skipna)  # type: ignore[arg-type]
+    result = _maybe_fix_arg_at_na(result, mask, axis)  # type: ignore[arg-type]
+    result = _maybe_arg_null_out(result, axis, mask, skipna)
     return result
 
 
@@ -1172,7 +1468,7 @@ def nanargmin(
     >>> from pandas.core import nanops
     >>> arr = np.array([1, 2, 3, np.nan, 4])
     >>> nanops.nanargmin(arr)
-    0
+    np.int64(0)
 
     >>> arr = np.array(range(12), dtype=np.float64).reshape(4, 3)
     >>> arr[2:, 0] = np.nan
@@ -1184,11 +1480,14 @@ def nanargmin(
     >>> nanops.nanargmin(arr, axis=1)
     array([0, 0, 1, 1])
     """
-    values, mask = _get_values(values, True, fill_value_typ="+inf", mask=mask)
+    values, mask = _get_arg_values(
+        values, fill_value_typ="+inf", mask=mask, skipna=skipna, axis=axis
+    )
     result = values.argmin(axis)
-    # error: Argument 1 to "_maybe_arg_null_out" has incompatible type "Any |
+    # error: Argument 1 to "_maybe_fix_arg_at_na" has incompatible type "Any |
     # signedinteger[Any]"; expected "ndarray[Any, Any]"
-    result = _maybe_arg_null_out(result, axis, mask, skipna)  # type: ignore[arg-type]
+    result = _maybe_fix_arg_at_na(result, mask, axis)  # type: ignore[arg-type]
+    result = _maybe_arg_null_out(result, axis, mask, skipna)
     return result
 
 
@@ -1200,7 +1499,7 @@ def nanskew(
     axis: AxisInt | None = None,
     skipna: bool = True,
     mask: npt.NDArray[np.bool_] | None = None,
-) -> float:
+) -> np.ndarray | float:
     """
     Compute the sample skewness.
 
@@ -1226,56 +1525,26 @@ def nanskew(
     --------
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, np.nan, 1, 2])
-    >>> nanops.nanskew(s.values)
-    1.7320508075688787
+    >>> round(nanops.nanskew(s.values), 6)
+    np.float64(1.732051)
     """
-    mask = _maybe_get_mask(values, skipna, mask)
-    if values.dtype.kind != "f":
-        values = values.astype("f8")
-        count = _get_counts(values.shape, mask, axis)
-    else:
-        count = _get_counts(values.shape, mask, axis, dtype=values.dtype)
-
-    if skipna and mask is not None:
-        values = values.copy()
-        np.putmask(values, mask, 0)
-    elif not skipna and mask is not None and mask.any():
-        return np.nan
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = values.sum(axis, dtype=np.float64) / count
-    if axis is not None:
-        mean = np.expand_dims(mean, axis)
-
-    adjusted = values - mean
-    if skipna and mask is not None:
-        np.putmask(adjusted, mask, 0)
-    adjusted2 = adjusted**2
-    adjusted3 = adjusted2 * adjusted
-    m2 = adjusted2.sum(axis, dtype=np.float64)
-    m3 = adjusted3.sum(axis, dtype=np.float64)
-
-    # floating point error
-    #
-    # #18044 in _libs/windows.pyx calc_skew follow this behavior
-    # to fix the fperr to treat m2 <1e-14 as zero
-    m2 = _zero_out_fperr(m2)
-    m3 = _zero_out_fperr(m3)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        result = (count * (count - 1) ** 0.5 / (count - 2)) * (m3 / m2**1.5)
-
     dtype = values.dtype
+    values = ensure_float64(values)
+
+    result: npt.NDArray[np.floating] | np.floating
+    if axis is None or (values.ndim == 1 and axis == 0):
+        order: Literal["F", "C"] = "F" if values.flags.f_contiguous else "C"
+        result_float = libalgos.scalar_skew(
+            values.ravel(order), skipna, mask.ravel(order) if mask is not None else None
+        )
+        result = np.float64(result_float)
+    elif axis in {0, 1}:
+        result = libalgos.axis_skew(values, axis, skipna, mask)
+    else:
+        raise ValueError("axis must be 0, 1 or None")
+
     if dtype.kind == "f":
         result = result.astype(dtype, copy=False)
-
-    if isinstance(result, np.ndarray):
-        result = np.where(m2 == 0, 0, result)
-        result[count < 3] = np.nan
-    else:
-        result = dtype.type(0) if m2 == 0 else result
-        if count < 3:
-            return np.nan
 
     return result
 
@@ -1288,7 +1557,7 @@ def nankurt(
     axis: AxisInt | None = None,
     skipna: bool = True,
     mask: npt.NDArray[np.bool_] | None = None,
-) -> float:
+) -> np.ndarray | float:
     """
     Compute the sample excess kurtosis
 
@@ -1314,65 +1583,26 @@ def nankurt(
     --------
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, np.nan, 1, 3, 2])
-    >>> nanops.nankurt(s.values)
-    -1.2892561983471076
+    >>> round(nanops.nankurt(s.values), 6)
+    np.float64(-1.289256)
     """
-    mask = _maybe_get_mask(values, skipna, mask)
-    if values.dtype.kind != "f":
-        values = values.astype("f8")
-        count = _get_counts(values.shape, mask, axis)
-    else:
-        count = _get_counts(values.shape, mask, axis, dtype=values.dtype)
-
-    if skipna and mask is not None:
-        values = values.copy()
-        np.putmask(values, mask, 0)
-    elif not skipna and mask is not None and mask.any():
-        return np.nan
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        mean = values.sum(axis, dtype=np.float64) / count
-    if axis is not None:
-        mean = np.expand_dims(mean, axis)
-
-    adjusted = values - mean
-    if skipna and mask is not None:
-        np.putmask(adjusted, mask, 0)
-    adjusted2 = adjusted**2
-    adjusted4 = adjusted2**2
-    m2 = adjusted2.sum(axis, dtype=np.float64)
-    m4 = adjusted4.sum(axis, dtype=np.float64)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        adj = 3 * (count - 1) ** 2 / ((count - 2) * (count - 3))
-        numerator = count * (count + 1) * (count - 1) * m4
-        denominator = (count - 2) * (count - 3) * m2**2
-
-    # floating point error
-    #
-    # #18044 in _libs/windows.pyx calc_kurt follow this behavior
-    # to fix the fperr to treat denom <1e-14 as zero
-    numerator = _zero_out_fperr(numerator)
-    denominator = _zero_out_fperr(denominator)
-
-    if not isinstance(denominator, np.ndarray):
-        # if ``denom`` is a scalar, check these corner cases first before
-        # doing division
-        if count < 4:
-            return np.nan
-        if denominator == 0:
-            return values.dtype.type(0)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        result = numerator / denominator - adj
-
     dtype = values.dtype
+    values = ensure_float64(values)
+
+    result: npt.NDArray[np.floating] | np.floating
+    if axis is None or (values.ndim == 1 and axis == 0):
+        order: Literal["F", "C"] = "F" if values.flags.f_contiguous else "C"
+        result_float = libalgos.scalar_kurt(
+            values.ravel(order), skipna, mask.ravel(order) if mask is not None else None
+        )
+        result = np.float64(result_float)
+    elif axis in {0, 1}:
+        result = libalgos.axis_kurt(values, axis, skipna, mask)
+    else:
+        raise ValueError("axis must be 0, 1 or None")
+
     if dtype.kind == "f":
         result = result.astype(dtype, copy=False)
-
-    if isinstance(result, np.ndarray):
-        result = np.where(denominator == 0, 0, result)
-        result[count < 4] = np.nan
 
     return result
 
@@ -1407,11 +1637,30 @@ def nanprod(
     >>> from pandas.core import nanops
     >>> s = pd.Series([1, 2, 3, np.nan])
     >>> nanops.nanprod(s.values)
-    6.0
+    np.float64(6.0)
     """
     mask = _maybe_get_mask(values, skipna, mask)
 
-    if skipna and mask is not None:
+    if values.dtype == object and not skipna:
+        # GH#4147: see nansum
+        if mask is None:
+            mask = isna(values)
+        if mask.any():
+            try:
+                result = values.prod(axis)
+            except TypeError:
+                pass
+            else:
+                return _maybe_null_out(  # type: ignore[return-value]
+                    result, axis, mask, values.shape, min_count=min_count
+                )
+            if values.ndim == 1 or axis is None:
+                # error: Incompatible return value type (got "Union[Scalar,
+                # ndarray]", expected "float")
+                return _na_for_min_count(values, axis)  # type: ignore[return-value]
+            values = _blank_object_na_slices(values, mask, axis, 1)
+            min_count = _na_min_count(values, axis, min_count)
+    elif skipna and mask is not None:
         values = values.copy()
         values[mask] = 1
     result = values.prod(axis)
@@ -1420,6 +1669,31 @@ def nanprod(
     return _maybe_null_out(  # type: ignore[return-value]
         result, axis, mask, values.shape, min_count=min_count
     )
+
+
+def _maybe_fix_arg_at_na(
+    result: np.ndarray,
+    mask: npt.NDArray[np.bool_] | None,
+    axis: AxisInt | None,
+) -> np.ndarray:
+    # helper function for nanargmin/nanargmax.  Masked positions carry either
+    # the +/-inf sentinel or, for object dtype, the value at the first unmasked
+    # position (GH#4147).  Either way an argmin/argmax landing on a masked
+    # position means the fill is the extremum, so the first unmasked position
+    # holds it and is the correct result (GH#64478)
+    if mask is None or not mask.any():
+        return result
+    if axis is None or mask.ndim == 1:
+        if mask.ravel()[result] and not mask.all():
+            # error: Incompatible return value type (got "signedinteger[_32Bit
+            # | _64Bit]", expected "ndarray[tuple[Any, ...], dtype[Any]]")
+            return (~mask).ravel().argmax()  # type: ignore[return-value]
+    else:
+        indexer = np.expand_dims(result, axis)
+        arg_is_na = np.take_along_axis(mask, indexer, axis).squeeze(axis)
+        if arg_is_na.any():
+            result = np.where(arg_is_na, (~mask).argmax(axis), result)
+    return result
 
 
 def _maybe_arg_null_out(
@@ -1437,11 +1711,10 @@ def _maybe_arg_null_out(
             raise ValueError("Encountered all NA values")
         elif not skipna and mask.any():
             raise ValueError("Encountered an NA value with skipna=False")
-    else:
-        if skipna and mask.all(axis).any():
-            raise ValueError("Encountered all NA values")
-        elif not skipna and mask.any(axis).any():
-            raise ValueError("Encountered an NA value with skipna=False")
+    elif skipna and mask.all(axis).any():
+        raise ValueError("Encountered all NA values")
+    elif not skipna and mask.any(axis).any():
+        raise ValueError("Encountered an NA value with skipna=False")
     return result
 
 
@@ -1487,20 +1760,21 @@ def _get_counts(
 
 
 def _maybe_null_out(
-    result: np.ndarray | float | NaTType,
+    result: np.ndarray | np.int64 | float | NaTType,
     axis: AxisInt | None,
     mask: npt.NDArray[np.bool_] | None,
     shape: tuple[int, ...],
     min_count: int = 1,
-) -> np.ndarray | float | NaTType:
+    datetimelike: bool = False,
+) -> np.ndarray | np.int64 | float | NaTType:
     """
     Returns
     -------
     Dtype
         The product of all elements on a given axis. ( NaNs are treated as 1)
     """
-    if mask is None and min_count == 0:
-        # nothing to check; short-circuit
+    if min_count <= 0:
+        # min_count <= 0 never nulls out; short-circuit
         return result
 
     if axis is not None and isinstance(result, np.ndarray):
@@ -1513,7 +1787,10 @@ def _maybe_null_out(
             null_mask = np.broadcast_to(below_count, new_shape)
 
         if np.any(null_mask):
-            if is_numeric_dtype(result):
+            if datetimelike:
+                # GH#60646 For datetimelike, no need to cast to float
+                result[null_mask] = iNaT
+            elif is_numeric_dtype(result):
                 if np.iscomplexobj(result):
                     result = result.astype("c16")
                 elif not is_float_dtype(result):
@@ -1565,14 +1842,6 @@ def check_below_min_count(
     return False
 
 
-def _zero_out_fperr(arg):
-    # #18044 reference this behavior to fix rolling skew/kurt issue
-    if isinstance(arg, np.ndarray):
-        return np.where(np.abs(arg) < 1e-14, 0, arg)
-    else:
-        return arg.dtype.type(0) if np.abs(arg) < 1e-14 else arg
-
-
 @disallow("M8", "m8")
 def nancorr(
     a: np.ndarray,
@@ -1611,21 +1880,21 @@ def get_corr_func(
     if method == "kendall":
         from scipy.stats import kendalltau
 
-        def func(a, b):
+        def func(a, b):  # pyright: ignore[reportRedeclaration]
             return kendalltau(a, b)[0]
 
         return func
     elif method == "spearman":
         from scipy.stats import spearmanr
 
-        def func(a, b):
+        def func(a, b):  # pyright: ignore[reportRedeclaration]
             return spearmanr(a, b)[0]
 
         return func
     elif method == "pearson":
 
         def func(a, b):
-            return np.corrcoef(a, b)[0, 1]
+            return _pearson_corr(a, b)
 
         return func
     elif callable(method):
@@ -1635,6 +1904,41 @@ def get_corr_func(
         f"Unknown method '{method}', expected one of "
         "'kendall', 'spearman', 'pearson', or callable"
     )
+
+
+def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.ndim != 1 or b.ndim != 1 or np.iscomplexobj(a) or np.iscomplexobj(b):
+        return np.corrcoef(a, b)[0, 1]
+
+    if len(a) < 2:
+        return np.nan
+
+    a = a.astype(np.float64, copy=False)
+    b = b.astype(np.float64, copy=False)
+
+    a = a - a.mean()
+    b = b - b.mean()
+    a_scale = np.max(np.abs(a))
+    b_scale = np.max(np.abs(b))
+
+    if a_scale == 0 or b_scale == 0:
+        return np.nan
+
+    a = a / a_scale
+    b = b / b_scale
+    fact = len(a) - 1
+    divisor = np.sqrt(np.dot(a, a) / fact)
+
+    if divisor == 0:
+        return np.nan
+
+    result = np.dot(a, b) / fact / divisor
+    divisor = np.sqrt(np.dot(b, b) / fact)
+
+    if divisor == 0:
+        return np.nan
+
+    return np.clip(result / divisor, -1.0, 1.0)
 
 
 @disallow("M8", "m8")

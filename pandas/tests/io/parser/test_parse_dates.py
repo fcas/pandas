@@ -8,11 +8,16 @@ from datetime import (
     timedelta,
     timezone,
 )
-from io import StringIO
+from io import (
+    BytesIO,
+    StringIO,
+)
 
 import numpy as np
 import pytest
-import pytz
+
+from pandas._libs import lib
+from pandas.errors import Pandas4Warning
 
 import pandas as pd
 from pandas import (
@@ -62,6 +67,7 @@ KORD,19990127 22:00:00, 21:56:00, -0.5900, 1.7100, 5.1000, 0.0000, 290.0000
             datetime(1999, 1, 27, 21, 0),
             datetime(1999, 1, 27, 22, 0),
         ],
+        dtype="M8[us]",
         name="X1",
     )
     expected = DataFrame(
@@ -83,23 +89,22 @@ KORD,19990127 22:00:00, 21:56:00, -0.5900, 1.7100, 5.1000, 0.0000, 290.0000
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow
-def test_nat_parse(all_parsers):
+def test_nat_parse(all_parsers, temp_file):
     # see gh-3062
     parser = all_parsers
     df = DataFrame(
         {
             "A": np.arange(10, dtype="float64"),
-            "B": Timestamp("20010101").as_unit("ns"),
+            "B": Timestamp("20010101"),
         }
     )
     df.iloc[3:6, :] = np.nan
 
-    with tm.ensure_clean("__nat_parse_.csv") as path:
-        df.to_csv(path)
+    path = temp_file
+    df.to_csv(path)
 
-        result = parser.read_csv(path, index_col=0, parse_dates=["B"])
-        tm.assert_frame_equal(result, df)
+    result = parser.read_csv(path, index_col=0, parse_dates=["B"])
+    tm.assert_frame_equal(result, df)
 
 
 @skip_pyarrow
@@ -116,7 +121,6 @@ def test_parse_dates_implicit_first_col(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow
 def test_parse_dates_string(all_parsers):
     data = """date,A,B,C
 20090101,a,1,2
@@ -126,7 +130,7 @@ def test_parse_dates_string(all_parsers):
     parser = all_parsers
     result = parser.read_csv(StringIO(data), index_col="date", parse_dates=["date"])
     # freq doesn't round-trip
-    index = date_range("1/1/2009", periods=3, name="date")._with_freq(None)
+    index = date_range("1/1/2009", periods=3, name="date", unit="us")._with_freq(None)
 
     expected = DataFrame(
         {"A": ["a", "b", "c"], "B": [1, 3, 4], "C": [2, 4, 5]}, index=index
@@ -134,15 +138,24 @@ def test_parse_dates_string(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow
 @pytest.mark.parametrize("parse_dates", [[0, 2], ["a", "c"]])
 def test_parse_dates_column_list(all_parsers, parse_dates):
     data = "a,b,c\n01/01/2010,1,15/02/2010"
     parser = all_parsers
 
+    if parser.engine == "pyarrow":
+        msg = "The 'dayfirst' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(
+                StringIO(data), index_col=[0, 1], parse_dates=parse_dates, dayfirst=True
+            )
+        return
+
     expected = DataFrame(
         {"a": [datetime(2010, 1, 1)], "b": [1], "c": [datetime(2010, 2, 15)]}
     )
+    expected["a"] = expected["a"].astype("M8[us]")
+    expected["c"] = expected["c"].astype("M8[us]")
     expected = expected.set_index(["a", "b"])
 
     result = parser.read_csv(
@@ -151,7 +164,6 @@ def test_parse_dates_column_list(all_parsers, parse_dates):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow
 @pytest.mark.parametrize("index_col", [[0, 1], [1, 0]])
 def test_multi_index_parse_dates(all_parsers, index_col):
     data = """index1,index2,A,B,C
@@ -166,9 +178,10 @@ def test_multi_index_parse_dates(all_parsers, index_col):
 20090103,three,c,4,5
 """
     parser = all_parsers
+    dti = date_range("2009-01-01", periods=3, freq="D", unit="us")
     index = MultiIndex.from_product(
         [
-            (datetime(2009, 1, 1), datetime(2009, 1, 2), datetime(2009, 1, 3)),
+            dti,
             ("one", "two", "three"),
         ],
         names=["index1", "index2"],
@@ -209,25 +222,19 @@ def test_parse_tz_aware(all_parsers):
     data = "Date,x\n2012-06-13T01:39:00Z,0.5"
 
     result = parser.read_csv(StringIO(data), index_col=0, parse_dates=True)
-    # TODO: make unit check more specific
-    if parser.engine == "pyarrow":
-        result.index = result.index.as_unit("ns")
     expected = DataFrame(
         {"x": [0.5]}, index=Index([Timestamp("2012-06-13 01:39:00+00:00")], name="Date")
     )
     if parser.engine == "pyarrow":
-        expected_tz = pytz.utc
-    else:
-        expected_tz = timezone.utc
+        expected.index = expected.index.as_unit("s")
     tm.assert_frame_equal(result, expected)
-    assert result.index.tz is expected_tz
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"index_col": "C"}])
 def test_read_with_parse_dates_scalar_non_bool(all_parsers, kwargs):
     # see gh-5636
     parser = all_parsers
-    msg = "Only booleans and lists " "are accepted for the 'parse_dates' parameter"
+    msg = "Only booleans and lists are accepted for the 'parse_dates' parameter"
     data = """A,B,C
     1,2,2003-11-1"""
 
@@ -238,7 +245,7 @@ def test_read_with_parse_dates_scalar_non_bool(all_parsers, kwargs):
 @pytest.mark.parametrize("parse_dates", [(1,), np.array([4, 5]), {1, 3}])
 def test_read_with_parse_dates_invalid_type(all_parsers, parse_dates):
     parser = all_parsers
-    msg = "Only booleans and lists " "are accepted for the 'parse_dates' parameter"
+    msg = "Only booleans and lists are accepted for the 'parse_dates' parameter"
     data = """A,B,C
     1,2,2003-11-1"""
 
@@ -262,12 +269,11 @@ def test_bad_date_parse(all_parsers, cache, value):
     )
 
 
-@pytest.mark.parametrize("value", ["0"])
-def test_bad_date_parse_with_warning(all_parsers, cache, value):
+def test_bad_date_parse_with_warning(all_parsers, cache):
     # if we have an invalid date make sure that we handle this with
     # and w/o the cache properly.
     parser = all_parsers
-    s = StringIO((f"{value},\n") * 50000)
+    s = StringIO(("0,\n") * (start_caching_at + 1))
 
     if parser.engine == "pyarrow":
         # pyarrow reads "0" as 0 (of type int64), and so
@@ -297,6 +303,13 @@ def test_parse_dates_empty_string(all_parsers):
     # see gh-2263
     parser = all_parsers
     data = "Date,test\n2012-01-01,1\n,2"
+
+    if parser.engine == "pyarrow":
+        msg = "The 'na_filter' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(StringIO(data), parse_dates=["Date"], na_filter=False)
+        return
+
     result = parser.read_csv(StringIO(data), parse_dates=["Date"], na_filter=False)
 
     expected = DataFrame(
@@ -305,25 +318,46 @@ def test_parse_dates_empty_string(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow
+def test_parse_dates_missing_value(all_parsers):
+    # GH#47950 a missing value in a parse_dates column should become NaT,
+    # not be left as the string "None" (which the pyarrow engine used to do)
+    parser = all_parsers
+    data = "idx,date\n2,2000-01-01\n,\n"
+    result = parser.read_csv(StringIO(data), parse_dates=["date"])
+
+    expected = DataFrame(
+        {
+            "idx": [2.0, np.nan],
+            "date": [Timestamp("2000-01-01"), pd.NaT],
+        }
+    )
+    expected["date"] = expected["date"].astype("M8[us]")
+    tm.assert_frame_equal(result, expected)
+
+
 @pytest.mark.parametrize(
     "data,kwargs,expected",
     [
         (
             "a\n04.15.2016",
             {"parse_dates": ["a"]},
-            DataFrame([datetime(2016, 4, 15)], columns=["a"]),
+            DataFrame([datetime(2016, 4, 15)], columns=["a"], dtype="M8[us]"),
         ),
         (
             "a\n04.15.2016",
             {"parse_dates": True, "index_col": 0},
-            DataFrame(index=DatetimeIndex(["2016-04-15"], name="a"), columns=[]),
+            DataFrame(
+                index=DatetimeIndex(["2016-04-15"], dtype="M8[us]", name="a"),
+                columns=[],
+            ),
         ),
         (
             "a,b\n04.15.2016,09.16.2013",
             {"parse_dates": ["a", "b"]},
             DataFrame(
-                [[datetime(2016, 4, 15), datetime(2013, 9, 16)]], columns=["a", "b"]
+                [[datetime(2016, 4, 15), datetime(2013, 9, 16)]],
+                dtype="M8[us]",
+                columns=["a", "b"],
             ),
         ),
         (
@@ -331,7 +365,13 @@ def test_parse_dates_empty_string(all_parsers):
             {"parse_dates": True, "index_col": [0, 1]},
             DataFrame(
                 index=MultiIndex.from_tuples(
-                    [(datetime(2016, 4, 15), datetime(2013, 9, 16))], names=["a", "b"]
+                    [
+                        (
+                            Timestamp(2016, 4, 15),
+                            Timestamp(2013, 9, 16),
+                        )
+                    ],
+                    names=["a", "b"],
                 ),
                 columns=[],
             ),
@@ -341,6 +381,12 @@ def test_parse_dates_empty_string(all_parsers):
 def test_parse_dates_no_convert_thousands(all_parsers, data, kwargs, expected):
     # see gh-14066
     parser = all_parsers
+
+    if parser.engine == "pyarrow":
+        msg = "The 'thousands' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(StringIO(data), thousands=".", **kwargs)
+        return
 
     result = parser.read_csv(StringIO(data), thousands=".", **kwargs)
     tm.assert_frame_equal(result, expected)
@@ -399,6 +445,7 @@ def test_parse_timezone(all_parsers):
         end="2018-01-04 09:05:00",
         freq="1min",
         tz=timezone(timedelta(minutes=540)),
+        unit="us",
     )._with_freq(None)
     expected_data = {"dt": dti, "val": [23350, 23400, 23400, 23400, 23400]}
 
@@ -413,7 +460,7 @@ def test_parse_timezone(all_parsers):
 )
 def test_invalid_parse_delimited_date(all_parsers, date_string):
     parser = all_parsers
-    expected = DataFrame({0: [date_string]}, dtype="object")
+    expected = DataFrame({0: [date_string]}, dtype="str")
     result = parser.read_csv(
         StringIO(date_string),
         header=None,
@@ -437,7 +484,7 @@ def test_parse_delimited_date_swap_no_warning(
     all_parsers, date_string, dayfirst, expected, request
 ):
     parser = all_parsers
-    expected = DataFrame({0: [expected]}, dtype="datetime64[ns]")
+    expected = DataFrame({0: [expected]}, dtype="datetime64[us]")
     if parser.engine == "pyarrow":
         if not dayfirst:
             # "CSV parse error: Empty CSV file or block"
@@ -470,7 +517,7 @@ def test_parse_delimited_date_swap_with_warning(
     all_parsers, date_string, dayfirst, expected
 ):
     parser = all_parsers
-    expected = DataFrame({0: [expected]}, dtype="datetime64[ns]")
+    expected = DataFrame({0: [expected]}, dtype="datetime64[us]")
     warning_msg = (
         "Parsing dates in .* format when dayfirst=.* was specified. "
         "Pass `dayfirst=.*` or specify a format to silence this warning."
@@ -491,8 +538,8 @@ def test_parse_multiple_delimited_dates_with_swap_warnings():
     with pytest.raises(
         ValueError,
         match=(
-            r'^time data "31/05/2000" doesn\'t match format "%m/%d/%Y", '
-            r"at position 1. You might want to try:"
+            r'^time data "31/05/2000" doesn\'t match format "%m/%d/%Y". '
+            r"You might want to try:"
         ),
     ):
         pd.to_datetime(["01/01/2000", "31/05/2000", "31/05/2001", "01/02/2000"])
@@ -528,15 +575,15 @@ def test_missing_parse_dates_column_raises(
         )
 
 
-@xfail_pyarrow  # mismatched shape
+@xfail_pyarrow  # names shorter than columns produces wrong shape (not parse_dates)
 def test_date_parser_and_names(all_parsers):
     # GH#33699
     parser = all_parsers
     data = StringIO("""x,y\n1,2""")
     warn = UserWarning
     if parser.engine == "pyarrow":
-        # DeprecationWarning for passing a Manager object
-        warn = (UserWarning, DeprecationWarning)
+        # Pandas4Warning for passing a Manager object
+        warn = (UserWarning, Pandas4Warning)
     result = parser.read_csv_check_warnings(
         warn,
         "Could not infer format",
@@ -548,16 +595,18 @@ def test_date_parser_and_names(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # TypeError: an integer is required
 def test_date_parser_multiindex_columns(all_parsers):
     parser = all_parsers
     data = """a,b
 1,2
 2019-12-31,6"""
+    if parser.engine == "pyarrow":
+        with pytest.raises(ValueError, match="does not support a list of integers"):
+            parser.read_csv(StringIO(data), parse_dates=[("a", "1")], header=[0, 1])
+        return
+
     result = parser.read_csv(StringIO(data), parse_dates=[("a", "1")], header=[0, 1])
-    expected = DataFrame(
-        {("a", "1"): Timestamp("2019-12-31").as_unit("ns"), ("b", "2"): [6]}
-    )
+    expected = DataFrame({("a", "1"): Timestamp("2019-12-31"), ("b", "2"): [6]})
     tm.assert_frame_equal(result, expected)
 
 
@@ -600,7 +649,7 @@ def test_dayfirst_warnings():
     # CASE 1: valid input
     input = "date\n31/12/2014\n10/03/2011"
     expected = DatetimeIndex(
-        ["2014-12-31", "2011-03-10"], dtype="datetime64[ns]", freq=None, name="date"
+        ["2014-12-31", "2011-03-10"], dtype="datetime64[us]", freq=None, name="date"
     )
     warning_msg = (
         "Parsing dates in .* format when dayfirst=.* was specified. "
@@ -626,7 +675,7 @@ def test_dayfirst_warnings():
 
     # first in DD/MM/YYYY, second in MM/DD/YYYY
     input = "date\n31/12/2014\n03/30/2011"
-    expected = Index(["31/12/2014", "03/30/2011"], dtype="object", name="date")
+    expected = Index(["31/12/2014", "03/30/2011"], dtype="str", name="date")
 
     # A. use dayfirst=True
     res5 = read_csv(
@@ -661,7 +710,7 @@ def test_dayfirst_warnings_no_leading_zero(date_string, dayfirst):
     # GH47880
     initial_value = f"date\n{date_string}"
     expected = DatetimeIndex(
-        ["2014-01-31"], dtype="datetime64[ns]", freq=None, name="date"
+        ["2014-01-31"], dtype="datetime64[us]", freq=None, name="date"
     )
     warning_msg = (
         "Parsing dates in .* format when dayfirst=.* was specified. "
@@ -690,7 +739,6 @@ def test_infer_first_column_as_index(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # pyarrow engine doesn't support passing a dict for na_values
 def test_replace_nans_before_parsing_dates(all_parsers):
     # GH#26203
     parser = all_parsers
@@ -701,6 +749,17 @@ def test_replace_nans_before_parsing_dates(all_parsers):
 #
 2017-09-09
 """
+    if parser.engine == "pyarrow":
+        msg = "The pyarrow engine doesn't support passing a dict for na_values"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(
+                StringIO(data),
+                na_values={"Test": ["#", "0"]},
+                parse_dates=["Test"],
+                date_format="%Y-%m-%d",
+            )
+        return
+
     result = parser.read_csv(
         StringIO(data),
         na_values={"Test": ["#", "0"]},
@@ -716,12 +775,12 @@ def test_replace_nans_before_parsing_dates(all_parsers):
                 pd.NaT,
                 Timestamp("2017-09-09"),
             ]
-        }
+        },
+        dtype="M8[us]",
     )
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # string[python] instead of dt64[ns]
 def test_parse_dates_and_string_dtype(all_parsers):
     # GH#34066
     parser = all_parsers
@@ -740,23 +799,14 @@ def test_parse_dot_separated_dates(all_parsers):
     data = """a,b
 27.03.2003 14:55:00.000,1
 03.08.2003 15:20:00.000,2"""
-    if parser.engine == "pyarrow":
-        expected_index = Index(
-            ["27.03.2003 14:55:00.000", "03.08.2003 15:20:00.000"],
-            dtype="object",
-            name="a",
-        )
-        warn = None
-    else:
-        expected_index = DatetimeIndex(
-            ["2003-03-27 14:55:00", "2003-08-03 15:20:00"],
-            dtype="datetime64[ns]",
-            name="a",
-        )
-        warn = UserWarning
+    expected_index = DatetimeIndex(
+        ["2003-03-27 14:55:00", "2003-08-03 15:20:00"],
+        dtype="datetime64[us]",
+        name="a",
+    )
     msg = r"when dayfirst=False \(the default\) was specified"
     result = parser.read_csv_check_warnings(
-        warn,
+        UserWarning,
         msg,
         StringIO(data),
         parse_dates=True,
@@ -783,12 +833,12 @@ def test_parse_dates_dict_format(all_parsers):
         {
             "a": [Timestamp("2019-12-31"), Timestamp("2020-12-31")],
             "b": [Timestamp("2019-12-31"), Timestamp("2020-12-31")],
-        }
+        },
+        dtype="M8[us]",
     )
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # object dtype index
 def test_parse_dates_dict_format_index(all_parsers):
     # GH#51240
     parser = all_parsers
@@ -816,9 +866,6 @@ def test_parse_dates_arrow_engine(all_parsers):
 2000-01-01 00:00:01,1"""
 
     result = parser.read_csv(StringIO(data), parse_dates=["a"])
-    # TODO: make unit check more specific
-    if parser.engine == "pyarrow":
-        result["a"] = result["a"].dt.as_unit("ns")
     expected = DataFrame(
         {
             "a": [
@@ -828,10 +875,15 @@ def test_parse_dates_arrow_engine(all_parsers):
             "b": 1,
         }
     )
+    if parser.engine == "pyarrow":
+        expected["a"] = expected["a"].astype("M8[s]")
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # object dtype index
+# pyarrow normalizes mixed offsets to UTC; reading as strings to preserve them
+# would change the resolution of cleanly-parsed datetimes (see
+# test_parse_dates_arrow_engine), so this divergence is left for a follow-up.
+@xfail_pyarrow  # returns datetime64[s, UTC] instead of the original strings
 def test_from_csv_with_mixed_offsets(all_parsers):
     parser = all_parsers
     data = "a\n2020-01-01T00:00:00+01:00\n2020-01-01T00:00:00+00:00"
@@ -845,3 +897,215 @@ def test_from_csv_with_mixed_offsets(all_parsers):
         index=[0, 1],
     )
     tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "a\n2020-01-01\n2020-01-02\n",
+        "a\n2020-01-01 00:00:00\n2020-01-02 01:02:03\n",
+        "a\n2020-01-01 00:00:00.123\n2020-01-02 04:05:06.789\n",
+        "a\n2020-01-01 00:00:00.123456789\n2020-01-02 00:00:00.000000001\n",
+        "a\n2020-01-01T00:00:00Z\n2020-01-02T03:00:00Z\n",
+        "a\n2020-01-01T00:00:00+05:00\n2020-01-02T03:00:00+05:00\n",
+        "a\nNaT\n2020-01-02\n",
+        "a,b\n,1\n2020-01-02,2\n",
+        "a,b\n,1\n,2\n",
+        # mixed ISO layouts: to_datetime infers one format from the first
+        # value and rejects the rest, leaving strings
+        "a\n2020-01-01\n2020-01-02 10:00\n",
+        "a\n2020-01-01 00:00:00.123456789\n2020-01-02\n",
+        "a\n2020-01-01T00:00:00Z\n2020-01-02T00:00:00+00:00\n",
+        # non-ISO goes through the object path
+        "a\n01/02/2020\n01/03/2020\n",
+    ],
+)
+@pytest.mark.parametrize("low_memory", [False, True])
+@pytest.mark.parametrize("dtype_backend", [lib.no_default, "numpy_nullable", "pyarrow"])
+def test_parse_dates_c_fastpath_matches_python_engine(data, low_memory, dtype_backend):
+    # GH#65353 the C parser parses ISO8601 parse_dates columns directly to
+    # datetime64; results must match the slow path
+    if dtype_backend == "pyarrow":
+        pytest.importorskip("pyarrow")
+    result = read_csv(
+        StringIO(data),
+        parse_dates=["a"],
+        engine="c",
+        low_memory=low_memory,
+        dtype_backend=dtype_backend,
+    )
+    expected = read_csv(
+        StringIO(data), parse_dates=["a"], engine="python", dtype_backend=dtype_backend
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "a\n2020-01-01\n2020-01-02 10:00\n",
+        # second value bumps the inferred resolution mid-column
+        "a\n2020-01-02\n2020-01-01 00:00:00.123456789\n",
+    ],
+)
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_iso8601_format_matches_python_engine(data, low_memory):
+    # GH#65353 with date_format="ISO8601", mixed ISO layouts parse per-row
+    kwargs = {"parse_dates": ["a"], "date_format": "ISO8601"}
+    result = read_csv(StringIO(data), engine="c", low_memory=low_memory, **kwargs)
+    expected = read_csv(StringIO(data), engine="python", **kwargs)
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_embedded_nul(low_memory):
+    # GH#65353 an embedded NUL after a valid ISO prefix must not be silently
+    # truncated to a parsed datetime; the column stays strings like the
+    # object path (which warns: the NUL word defeats format inference)
+    data = b"a,b\n2020-01-01\x00X,1\n2020-01-02,2\n"
+    with tm.assert_produces_warning(UserWarning, match="Could not infer format"):
+        result = read_csv(
+            BytesIO(data), parse_dates=["a"], engine="c", low_memory=low_memory
+        )
+    with tm.assert_produces_warning(UserWarning, match="Could not infer format"):
+        expected = read_csv(BytesIO(data), parse_dates=["a"], engine="python")
+    tm.assert_frame_equal(result, expected)
+    assert result["a"].tolist() == ["2020-01-01\x00X", "2020-01-02"]
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_usecols_integer_colspec(low_memory):
+    # GH#65353 integer parse_dates colspecs are positions within usecols,
+    # not the full table
+    data = "a,b,c,d\n1,2020-01-01,x,2020-02-01\n2,2020-01-02,y,2020-02-02\n"
+    kwargs = {"usecols": [1, 3], "parse_dates": [1]}
+    result = read_csv(StringIO(data), engine="c", low_memory=low_memory, **kwargs)
+    expected = read_csv(StringIO(data), engine="python", **kwargs)
+    tm.assert_frame_equal(result, expected)
+    assert result["d"].dtype.kind == "M"
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_out_of_bounds_offset(low_memory):
+    # GH#65353 shifting this value to UTC overflows datetime64[ns]; the fastpath
+    # must not silently wrap it to a bogus in-bounds datetime. Like any
+    # unparsable parse_dates value it falls back to the raw strings, matching
+    # the python engine.
+    data = "a\n2262-04-11T20:00:00.000000000-11:00\n"
+    result = read_csv(StringIO(data), parse_dates=["a"], low_memory=low_memory)["a"]
+    expected = read_csv(StringIO(data), parse_dates=["a"], engine="python")["a"]
+    tm.assert_series_equal(result, expected)
+    assert result.iloc[0] == "2262-04-11T20:00:00.000000000-11:00"
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_nat_sentinel(low_memory):
+    # GH#66510 this renders onto iNaT, which the fastpath cannot tell apart from
+    # a missing value. It falls back to the raw strings like any other date the
+    # fastpath cannot represent, rather than emitting a bogus NaT.
+    data = "a\n1677-09-21 00:12:43.145224192\n"
+    result = read_csv(StringIO(data), parse_dates=["a"], low_memory=low_memory)["a"]
+    expected = read_csv(StringIO(data), parse_dates=["a"], engine="python")["a"]
+    tm.assert_series_equal(result, expected)
+    assert result.iloc[0] == "1677-09-21 00:12:43.145224192"
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_nat_sentinel_shifts_into_range(low_memory):
+    # GH#66510 the wall time renders onto iNaT but the westward shift moves it
+    # back in bounds, so the column still parses
+    data = "a\n1677-09-21 00:12:43.145224192-01:00\n"
+    result = read_csv(StringIO(data), parse_dates=["a"], low_memory=low_memory)["a"]
+    expected = read_csv(StringIO(data), parse_dates=["a"], engine="python")["a"]
+    tm.assert_series_equal(result, expected)
+    assert result.array.asi8[0] == -(2**63) + 3600 * 10**9
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_parse_dates_c_fastpath_nat_sentinel_neighbour(low_memory):
+    # GH#66510 one nanosecond later is representable and must still parse
+    data = "a\n1677-09-21 00:12:43.145224193\n"
+    result = read_csv(StringIO(data), parse_dates=["a"], low_memory=low_memory)["a"]
+    assert result.iloc[0] == Timestamp("1677-09-21 00:12:43.145224193")
+
+
+def _multichunk_csv(date_strings):
+    # wide enough that 20k rows span several low_memory chunks
+    num_extra_cols = 63
+    tail = ",".join(["1"] * num_extra_cols)
+    header = ",".join(["a"] + [f"c{i}" for i in range(num_extra_cols)])
+    lines = [header] + [f"{val},{tail}" for val in date_strings]
+    return "\n".join(lines) + "\n"
+
+
+def test_parse_dates_low_memory_iso_then_non_iso_chunks():
+    # GH#65353 with low_memory, a non-ISO value in a later chunk must not
+    # leave earlier chunks datetime-parsed (and later re-stringified)
+    date_strings = [f"2020-01-{(i % 28) + 1:02d}" for i in range(19_999)]
+    date_strings.append("not-a-date")
+    data = _multichunk_csv(date_strings)
+
+    with tm.assert_produces_warning(None):
+        result = read_csv(StringIO(data), parse_dates=["a"], low_memory=True)["a"]
+    assert result.tolist() == date_strings
+
+
+def test_parse_dates_low_memory_iso_then_mismatched_layout_chunks():
+    # GH#65353 a later chunk whose layout deviates from the inferred format
+    # must also restore the whole column to the raw strings
+    date_strings = [f"2020-01-{(i % 28) + 1:02d}" for i in range(19_999)]
+    date_strings.append("2020-01-02 10:00")
+    data = _multichunk_csv(date_strings)
+
+    with tm.assert_produces_warning(None):
+        result = read_csv(StringIO(data), parse_dates=["a"], low_memory=True)["a"]
+    assert result.tolist() == date_strings
+
+
+@pytest.mark.parametrize("position", ["first", "last"])
+def test_parse_dates_low_memory_embedded_nul_chunks(position):
+    # GH#65353 an embedded-NUL value in any chunk keeps the whole column on
+    # the string path with the NUL preserved, whether the fastpath bails
+    # before converting anything ("first") or rebuilds earlier chunks from
+    # receipts ("last")
+    date_strings = [f"2020-01-{(i % 28) + 1:02d}" for i in range(19_999)]
+    # unique date prefix: avoids the NUL-terminated intern-table collision
+    # in _string_box_utf8, which is not under test here
+    nul_value = "2021-06-15\x00X"
+    if position == "first":
+        date_strings.insert(0, nul_value)
+    else:
+        date_strings.append(nul_value)
+    data = _multichunk_csv(date_strings)
+
+    # leading NUL word defeats to_datetime's format inference, which warns
+    warn = UserWarning if position == "first" else None
+    with tm.assert_produces_warning(warn, match="Could not infer format"):
+        result = read_csv(StringIO(data), parse_dates=["a"], low_memory=True)["a"]
+    assert result.tolist() == date_strings
+
+
+def test_parse_dates_low_memory_multichunk_datetimes():
+    # GH#65353 an all-ISO column spanning several low_memory chunks parses
+    # identically to a non-chunked read
+    date_strings = [f"2020-01-{(i % 28) + 1:02d}" for i in range(20_000)]
+    data = _multichunk_csv(date_strings)
+
+    result = read_csv(StringIO(data), parse_dates=["a"], low_memory=True)["a"]
+    expected = read_csv(StringIO(data), parse_dates=["a"], low_memory=False)["a"]
+    tm.assert_series_equal(result, expected)
+    assert result.dtype == "M8[us]"
+
+
+def test_parse_dates_low_memory_iso8601_reso_bump_across_chunks():
+    # GH#65353 with date_format="ISO8601", a higher-resolution value in a
+    # later chunk upcasts the whole column losslessly
+    date_strings = [f"2020-01-{(i % 28) + 1:02d}" for i in range(19_999)]
+    date_strings.append("2020-01-02 00:00:00.123456789")
+    data = _multichunk_csv(date_strings)
+
+    kwargs = {"parse_dates": ["a"], "date_format": "ISO8601"}
+    result = read_csv(StringIO(data), low_memory=True, **kwargs)["a"]
+    expected = read_csv(StringIO(data), low_memory=False, **kwargs)["a"]
+    tm.assert_series_equal(result, expected)
+    assert result.dtype == "M8[ns]"

@@ -92,7 +92,7 @@ class TestSeriesIsIn:
         tm.assert_series_equal(result, expected)
 
         # timedelta64[ns]
-        s = Series(pd.to_timedelta(range(5), unit="d"))
+        s = Series(pd.to_timedelta(range(5), unit="D"))
         result = s.isin(s[0:2])
         tm.assert_series_equal(result, expected)
 
@@ -211,6 +211,47 @@ def test_isin_large_series_mixed_dtypes_and_nan(monkeypatch):
     tm.assert_series_equal(result, expected)
 
 
+@pytest.mark.parametrize(
+    "dtype, data, values, expected",
+    [
+        ("boolean", [pd.NA, False, True], [False, pd.NA], [True, True, False]),
+        ("Int64", [pd.NA, 2, 1], [1, pd.NA], [True, False, True]),
+        ("boolean", [pd.NA, False, True], [pd.NA, True, "a", 20], [True, False, True]),
+        ("boolean", [pd.NA, False, True], [], [False, False, False]),
+        ("Float64", [20.0, 30.0, pd.NA], [pd.NA], [False, False, True]),
+    ],
+)
+def test_isin_large_series_and_pdNA(dtype, data, values, expected, monkeypatch):
+    # https://github.com/pandas-dev/pandas/issues/60678
+    # combination of  large series (> _MINIMUM_COMP_ARR_LEN elements) and
+    # values contains pdNA
+    min_isin_comp = 2
+    ser = Series(data, dtype=dtype)
+    expected = Series(expected, dtype="boolean")
+
+    with monkeypatch.context() as m:
+        m.setattr(algorithms, "_MINIMUM_COMP_ARR_LEN", min_isin_comp)
+        result = ser.isin(values)
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype, data, values, expected",
+    [
+        ("int64[pyarrow]", [1, None], [1, pd.NA], [True, True]),
+        ("binary[pyarrow]", [None, b"\xe3"], [pd.NA, b"\xe3"], [True, True]),
+    ],
+)
+def test_isin_arrow_dtype_with_na_value(dtype, data, values, expected):
+    # GH#63304
+    pytest.importorskip("pyarrow")
+
+    result = Series(data, dtype=dtype).isin(values)
+    expected = Series(expected)
+
+    tm.assert_series_equal(result, expected)
+
+
 def test_isin_complex_numbers():
     # GH 17927
     array = [0, 1j, 1j, 1, 1 + 1j, 1 + 2j, 1 + 1j]
@@ -243,3 +284,49 @@ def test_isin_filtering_on_iterable(data, isin):
     expected_result = Series([True, True, False])
 
     tm.assert_series_equal(result, expected_result)
+
+
+@pytest.mark.parametrize("set_cls", [set, frozenset])
+@pytest.mark.parametrize("dtype", ["int64", "int32", "uint8", "uint64"])
+@pytest.mark.parametrize("n_comps", [2, 20])
+def test_isin_set_matches_list(set_cls, dtype, n_comps):
+    # GH#25507: passing a set must match the list-based path. With a small
+    # comps (n_comps=2 < len(targets)) this exercises the set-membership fast
+    # path; with a larger comps it exercises the materialize-to-list fallback.
+    ser = Series(range(n_comps), dtype=dtype)
+    targets = [1, 3, 5, 7, 9, 11, 13]
+    expected = ser.isin(list(targets))
+    result = ser.isin(set_cls(targets))
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize("set_cls", [set, frozenset])
+def test_isin_set_matches_list_bool(set_cls):
+    # GH#25507: boolean comps go through the same set fast path (taken here
+    # since the single-element comps is smaller than the two-element set).
+    ser = Series([True])
+    expected = ser.isin([True, False])
+    result = ser.isin(set_cls([True, False]))
+    tm.assert_series_equal(result, expected)
+
+
+def test_isin_empty_set():
+    # GH#25507 set fast path must handle empty set
+    ser = Series([1, 2, 3])
+    result = ser.isin(set())
+    expected = Series([False, False, False])
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize("n_comps", [1, 2])
+@pytest.mark.parametrize("magnitude", [2**53, 2**53 + 1])
+@pytest.mark.parametrize("values", [{2.0**53, 0.5}, {2**53 + 1, 0.5}])
+def test_isin_set_large_int_comps_matches_list(n_comps, magnitude, values):
+    # GH#25507: comps at or beyond float64's exact-int range can match
+    # lossily under the materialized path (which casts through float64) but
+    # not under exact set membership; the result must not depend on the
+    # comps size.
+    ser = Series([magnitude] * n_comps, dtype="int64")
+    result = ser.isin(values)
+    expected = ser.isin(list(values))
+    tm.assert_series_equal(result, expected)

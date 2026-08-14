@@ -1,6 +1,11 @@
 import numpy as np
 import pytest
 
+from pandas.errors import (
+    IncompatibleFrequency,
+    Pandas4Warning,
+)
+
 from pandas import (
     Index,
     NaT,
@@ -37,7 +42,8 @@ class TestPeriodIndex:
         idx = PeriodIndex([], freq="M")
 
         exp = np.array([], dtype=object)
-        tm.assert_numpy_array_equal(idx.values, exp)
+        with tm.assert_produces_warning(Pandas4Warning):
+            tm.assert_numpy_array_equal(idx.values, exp)
         tm.assert_numpy_array_equal(idx.to_numpy(), exp)
 
         exp = np.array([], dtype=np.int64)
@@ -46,7 +52,8 @@ class TestPeriodIndex:
         idx = PeriodIndex(["2011-01", NaT], freq="M")
 
         exp = np.array([Period("2011-01", freq="M"), NaT], dtype=object)
-        tm.assert_numpy_array_equal(idx.values, exp)
+        with tm.assert_produces_warning(Pandas4Warning):
+            tm.assert_numpy_array_equal(idx.values, exp)
         tm.assert_numpy_array_equal(idx.to_numpy(), exp)
         exp = np.array([492, -9223372036854775808], dtype=np.int64)
         tm.assert_numpy_array_equal(idx.asi8, exp)
@@ -54,7 +61,8 @@ class TestPeriodIndex:
         idx = PeriodIndex(["2011-01-01", NaT], freq="D")
 
         exp = np.array([Period("2011-01-01", freq="D"), NaT], dtype=object)
-        tm.assert_numpy_array_equal(idx.values, exp)
+        with tm.assert_produces_warning(Pandas4Warning):
+            tm.assert_numpy_array_equal(idx.values, exp)
         tm.assert_numpy_array_equal(idx.to_numpy(), exp)
         exp = np.array([14975, -9223372036854775808], dtype=np.int64)
         tm.assert_numpy_array_equal(idx.asi8, exp)
@@ -70,9 +78,7 @@ class TestPeriodIndex:
             "second",
             "weekofyear",
             "week",
-            "dayofweek",
             "day_of_week",
-            "dayofyear",
             "day_of_year",
             "quarter",
             "qyear",
@@ -100,7 +106,7 @@ class TestPeriodIndex:
 
         field_idx = getattr(periodindex, field)
         assert len(periodindex) == len(field_idx)
-        for x, val in zip(periods, field_idx):
+        for x, val in zip(periods, field_idx, strict=True):
             assert getattr(x, field) == val
 
         if len(ser) == 0:
@@ -108,7 +114,7 @@ class TestPeriodIndex:
 
         field_s = getattr(ser.dt, field)
         assert len(periodindex) == len(field_s)
-        for x, val in zip(periods, field_s):
+        for x, val in zip(periods, field_s, strict=True):
             assert getattr(x, field) == val
 
     def test_is_(self):
@@ -130,8 +136,8 @@ class TestPeriodIndex:
         assert not index.is_(index - 0)
 
     def test_index_unique(self):
-        idx = PeriodIndex([2000, 2007, 2007, 2009, 2009], freq="Y-JUN")
-        expected = PeriodIndex([2000, 2007, 2009], freq="Y-JUN")
+        idx = PeriodIndex(["2000", "2007", "2007", "2009", "2009"], freq="Y-JUN")
+        expected = PeriodIndex(["2000", "2007", "2009"], freq="Y-JUN")
         tm.assert_index_equal(idx.unique(), expected)
         assert idx.nunique() == 3
 
@@ -184,7 +190,7 @@ class TestPeriodIndex:
     def test_map(self):
         # test_map_dictlike generally tests
 
-        index = PeriodIndex([2005, 2007, 2009], freq="Y")
+        index = PeriodIndex(["2005", "2007", "2009"], freq="Y")
         result = index.map(lambda x: x.ordinal)
         exp = Index([x.ordinal for x in index])
         tm.assert_index_equal(result, exp)
@@ -198,7 +204,7 @@ def test_maybe_convert_timedelta():
 
     offset = offsets.BusinessDay()
     msg = r"Input has different freq=B from PeriodIndex\(freq=D\)"
-    with pytest.raises(ValueError, match=msg):
+    with pytest.raises(IncompatibleFrequency, match=msg):
         pi._maybe_convert_timedelta(offset)
 
 

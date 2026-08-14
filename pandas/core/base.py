@@ -4,12 +4,12 @@ Base and utility classes for pandas objects.
 
 from __future__ import annotations
 
-import textwrap
 from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
     Literal,
+    Self,
     cast,
     final,
     overload,
@@ -23,17 +23,13 @@ from pandas._typing import (
     DtypeObj,
     IndexLabel,
     NDFrameT,
-    Self,
     Shape,
     npt,
 )
 from pandas.compat import PYPY
 from pandas.compat.numpy import function as nv
 from pandas.errors import AbstractMethodError
-from pandas.util._decorators import (
-    cache_readonly,
-    doc,
-)
+from pandas.util._decorators import cache_readonly
 
 from pandas.core.dtypes.cast import can_hold_element
 from pandas.core.dtypes.common import (
@@ -44,6 +40,7 @@ from pandas.core.dtypes.dtypes import ExtensionDtype
 from pandas.core.dtypes.generic import (
     ABCDataFrame,
     ABCIndex,
+    ABCMultiIndex,
     ABCSeries,
 )
 from pandas.core.dtypes.missing import (
@@ -84,12 +81,9 @@ if TYPE_CHECKING:
     )
 
 
-_shared_docs: dict[str, str] = {}
-
-
 class PandasObject(DirNamesMixin):
     """
-    Baseclass for various pandas objects.
+    Base class for various pandas objects.
     """
 
     # results from calls to methods decorated with cache_readonly get added to _cache
@@ -211,11 +205,7 @@ class SelectionMixin(Generic[NDFrameT]):
             return self.obj[self._selection_list]
 
         if len(self.exclusions) > 0:
-            # equivalent to `self.obj.drop(self.exclusions, axis=1)
-            #  but this avoids consolidating and making a copy
-            # TODO: following GH#45287 can we now use .drop directly without
-            #  making a copy?
-            return self.obj._drop_axis(self.exclusions, axis=1, only_slice=True)
+            return self.obj._drop_axis(self.exclusions, axis=1)
         else:
             return self.obj
 
@@ -309,6 +299,10 @@ class IndexOpsMixin(OpsMixin):
         doc="""
         Return the transpose, which is by definition self.
 
+        For 1D objects (Series, Index) transposition has no effect; the
+        object is returned unchanged. Provided for API compatibility with
+        DataFrame and NumPy.
+
         See Also
         --------
         Index : Immutable sequence used for indexing and alignment.
@@ -322,12 +316,12 @@ class IndexOpsMixin(OpsMixin):
         0     Ant
         1    Bear
         2     Cow
-        dtype: object
+        dtype: str
         >>> s.T
         0     Ant
         1    Bear
         2     Cow
-        dtype: object
+        dtype: str
 
         For Index:
 
@@ -341,6 +335,10 @@ class IndexOpsMixin(OpsMixin):
     def shape(self) -> Shape:
         """
         Return a tuple of the shape of the underlying data.
+
+        For a Series this is ``(length,)``; for a 1D Index, likewise a
+        single-element tuple. Useful for compatibility with NumPy and
+        other array-like APIs.
 
         See Also
         --------
@@ -360,10 +358,16 @@ class IndexOpsMixin(OpsMixin):
         # We need this defined here for mypy
         raise AbstractMethodError(self)
 
+    # Temporarily avoid using `-> Literal[1]:` because of an IPython (jedi) bug
+    # https://github.com/ipython/ipython/issues/14412
+    # https://github.com/davidhalter/jedi/issues/1990
     @property
-    def ndim(self) -> Literal[1]:
+    def ndim(self) -> int:
         """
         Number of dimensions of the underlying data, by definition 1.
+
+        Series and Index are one-dimensional; this property always returns 1
+        for compatibility with array-like interfaces.
 
         See Also
         --------
@@ -379,7 +383,7 @@ class IndexOpsMixin(OpsMixin):
         0     Ant
         1    Bear
         2     Cow
-        dtype: object
+        dtype: str
         >>> s.ndim
         1
 
@@ -397,6 +401,10 @@ class IndexOpsMixin(OpsMixin):
     def item(self):
         """
         Return the first element of the underlying data as a Python scalar.
+
+        This method extracts the single element from a length-1 Series or
+        Index and returns it as a native Python scalar type (e.g., ``int``,
+        ``float``, ``str``).
 
         Returns
         -------
@@ -434,6 +442,9 @@ class IndexOpsMixin(OpsMixin):
         """
         Return the number of bytes in the underlying data.
 
+        Includes only the memory used by the array values; overhead such as
+        the index is not included. Useful for estimating memory usage.
+
         See Also
         --------
         Series.ndim : Number of dimensions of the underlying data.
@@ -448,9 +459,9 @@ class IndexOpsMixin(OpsMixin):
         0     Ant
         1    Bear
         2     Cow
-        dtype: object
+        dtype: str
         >>> s.nbytes
-        24
+        34
 
         For Index:
 
@@ -466,6 +477,9 @@ class IndexOpsMixin(OpsMixin):
     def size(self) -> int:
         """
         Return the number of elements in the underlying data.
+
+        For a Series or Index this is the length (number of rows). Equivalent
+        to ``len(obj)`` and ``np.prod(obj.shape)``.
 
         See Also
         --------
@@ -483,7 +497,7 @@ class IndexOpsMixin(OpsMixin):
         0     Ant
         1    Bear
         2     Cow
-        dtype: object
+        dtype: str
         >>> s.size
         3
 
@@ -501,6 +515,11 @@ class IndexOpsMixin(OpsMixin):
     def array(self) -> ExtensionArray:
         """
         The ExtensionArray of the data backing this Series or Index.
+
+        This property provides direct access to the underlying array data of a
+        Series or Index without requiring conversion to a NumPy array. It
+        returns an ExtensionArray, which is the native storage format for
+        pandas extension dtypes.
 
         Returns
         -------
@@ -558,7 +577,7 @@ class IndexOpsMixin(OpsMixin):
         >>> ser = pd.Series(pd.Categorical(["a", "b", "a"]))
         >>> ser.array
         ['a', 'b', 'a']
-        Categories (2, object): ['a', 'b']
+        Categories (2, str): ['a', 'b']
         """
         raise AbstractMethodError(self)
 
@@ -571,6 +590,11 @@ class IndexOpsMixin(OpsMixin):
     ) -> np.ndarray:
         """
         A NumPy ndarray representing the values in this Series or Index.
+
+        This method converts the underlying data to a NumPy array, optionally
+        specifying the desired dtype and handling of missing values. For
+        extension types, this may require copying data and coercing to a NumPy
+        type.
 
         Parameters
         ----------
@@ -633,6 +657,17 @@ class IndexOpsMixin(OpsMixin):
         datetime64[ns, tz] ndarray[object] (Timestamps)
         ================== ================================
 
+        For timezone-aware datetime data, calling ``to_numpy()`` without
+        specifying ``dtype`` produces an object-dtype array of
+        :class:`Timestamp` objects. This is significantly slower and uses
+        more memory than a native ``datetime64`` array. To avoid this,
+        pass an explicit ``dtype``:
+
+        - ``dtype="datetime64[ns]"`` converts to UTC and drops the
+          timezone, returning a native ``datetime64[ns]`` array.
+        - ``dtype=object`` explicitly requests Timestamp objects when
+          you need to preserve per-element timezone information.
+
         Examples
         --------
         >>> ser = pd.Series(pd.Categorical(["a", "b", "a"]))
@@ -687,8 +722,10 @@ class IndexOpsMixin(OpsMixin):
         result = np.asarray(values, dtype=dtype)
 
         if (copy and not fillna) or not copy:
-            if np.shares_memory(self._values[:2], result[:2]):
-                # Take slices to improve performance of check
+            # Check identity first (O(1)) before the more expensive
+            # shares_memory check. Use the already-fetched `values` to
+            # avoid a second _values property access.
+            if result is values or np.shares_memory(values[:2], result[:2]):
                 if not copy:
                     result = result.view()
                     result.flags.writeable = False
@@ -741,19 +778,18 @@ class IndexOpsMixin(OpsMixin):
         """
         return not self.size
 
-    @doc(op="max", oppose="min", value="largest")
     def argmax(
         self, axis: AxisInt | None = None, skipna: bool = True, *args, **kwargs
     ) -> int:
         """
-        Return int position of the {value} value in the Series.
+        Return int position of the largest value in the Series.
 
-        If the {op}imum is achieved in multiple locations,
+        If the maximum is achieved in multiple locations,
         the first row position is returned.
 
         Parameters
         ----------
-        axis : {{None}}
+        axis : None
             Unused. Parameter needed for compatibility with DataFrame.
         skipna : bool, default True
             Exclude NA/null values. If the entire Series is NA, or if ``skipna=False``
@@ -764,13 +800,13 @@ class IndexOpsMixin(OpsMixin):
         Returns
         -------
         int
-            Row position of the {op}imum value.
+            Row position of the maximum value.
 
         See Also
         --------
-        Series.arg{op} : Return position of the {op}imum value.
-        Series.arg{oppose} : Return position of the {oppose}imum value.
-        numpy.ndarray.arg{op} : Equivalent method for numpy arrays.
+        Series.argmax : Return position of the maximum value.
+        Series.argmin : Return position of the minimum value.
+        numpy.ndarray.argmax : Equivalent method for numpy arrays.
         Series.idxmax : Return index label of the maximum values.
         Series.idxmin : Return index label of the minimum values.
 
@@ -795,9 +831,9 @@ class IndexOpsMixin(OpsMixin):
         dtype: float64
 
         >>> s.argmax()
-        2
+        np.int64(2)
         >>> s.argmin()
-        0
+        np.int64(0)
 
         The maximum cereal calories is the third element and
         the minimum cereal calories is the first element,
@@ -815,10 +851,67 @@ class IndexOpsMixin(OpsMixin):
             # "int")
             return result  # type: ignore[return-value]
 
-    @doc(argmax, op="min", oppose="max", value="smallest")
     def argmin(
         self, axis: AxisInt | None = None, skipna: bool = True, *args, **kwargs
     ) -> int:
+        """
+        Return int position of the smallest value in the Series.
+
+        If the minimum is achieved in multiple locations,
+        the first row position is returned.
+
+        Parameters
+        ----------
+        axis : None
+            Unused. Parameter needed for compatibility with DataFrame.
+        skipna : bool, default True
+            Exclude NA/null values. If the entire Series is NA, or if ``skipna=False``
+            and there is an NA value, this method will raise a ``ValueError``.
+        *args, **kwargs
+            Additional arguments and keywords for compatibility with NumPy.
+
+        Returns
+        -------
+        int
+            Row position of the minimum value.
+
+        See Also
+        --------
+        Series.argmin : Return position of the minimum value.
+        Series.argmax : Return position of the maximum value.
+        numpy.ndarray.argmin : Equivalent method for numpy arrays.
+        Series.idxmin : Return index label of the minimum values.
+        Series.idxmax : Return index label of the maximum values.
+
+        Examples
+        --------
+        Consider dataset containing cereal calories
+
+        >>> s = pd.Series(
+        ...     [100.0, 110.0, 120.0, 110.0],
+        ...     index=[
+        ...         "Corn Flakes",
+        ...         "Almond Delight",
+        ...         "Cinnamon Toast Crunch",
+        ...         "Cocoa Puff",
+        ...     ],
+        ... )
+        >>> s
+        Corn Flakes              100.0
+        Almond Delight           110.0
+        Cinnamon Toast Crunch    120.0
+        Cocoa Puff               110.0
+        dtype: float64
+
+        >>> s.argmax()
+        np.int64(2)
+        >>> s.argmin()
+        np.int64(0)
+
+        The maximum cereal calories is the third element and
+        the minimum cereal calories is the first element,
+        since series is zero-indexed.
+        """
         delegate = self._values
         nv.validate_minmax_axis(axis)
         skipna = nv.validate_argmax_with_skipna(skipna, args, kwargs)
@@ -984,7 +1077,12 @@ class IndexOpsMixin(OpsMixin):
             If True then the object returned will contain the relative
             frequencies of the unique values.
         sort : bool, default True
-            Sort by frequencies when True. Preserve the order of the data when False.
+            Stable sort by frequencies when True. Preserve the order of the data
+            when False.
+
+            .. versionchanged:: 3.0.0
+
+                Prior to 3.0.0, the sort was unstable.
         ascending : bool, default False
             Sort in ascending order.
         bins : int, optional
@@ -1049,6 +1147,34 @@ class IndexOpsMixin(OpsMixin):
         4.0    1
         NaN    1
         Name: count, dtype: int64
+
+        **Categorical Dtypes**
+
+        Rows with categorical type will be counted as one group
+        if they have same categories and order.
+        In the example below, even though ``a``, ``c``, and ``d``
+        all have the same data types of ``category``,
+        only ``c`` and ``d`` will be counted as one group
+        since ``a`` doesn't have the same categories.
+
+        >>> df = pd.DataFrame({"a": [1], "b": ["2"], "c": [3], "d": [3]})
+        >>> df = df.astype({"a": "category", "c": "category", "d": "category"})
+        >>> df
+           a  b  c  d
+        0  1  2  3  3
+
+        >>> df.dtypes
+        a    category
+        b      str
+        c    category
+        d    category
+        dtype: object
+
+        >>> df.dtypes.value_counts()
+        category    2
+        category    1
+        str         1
+        Name: count, dtype: int64
         """
         return algorithms.value_counts_internal(
             self,
@@ -1065,7 +1191,7 @@ class IndexOpsMixin(OpsMixin):
             # i.e. ExtensionArray
             result = values.unique()
         else:
-            result = algorithms.unique1d(values)
+            result = algorithms.unique1d(values)  # type: ignore[assignment]
         return result
 
     @final
@@ -1083,7 +1209,7 @@ class IndexOpsMixin(OpsMixin):
         Returns
         -------
         int
-            A integer indicating the number of unique elements in the object.
+            An integer indicating the number of unique elements in the object.
 
         See Also
         --------
@@ -1114,6 +1240,9 @@ class IndexOpsMixin(OpsMixin):
         """
         Return True if values in the object are unique.
 
+        This property checks whether all values in the Series or Index are
+        distinct, including missing values.
+
         Returns
         -------
         bool
@@ -1140,6 +1269,10 @@ class IndexOpsMixin(OpsMixin):
     def is_monotonic_increasing(self) -> bool:
         """
         Return True if values in the object are monotonically increasing.
+
+        This property checks whether each element is greater than or equal to
+        the previous element. Equal consecutive values are considered
+        monotonically increasing.
 
         Returns
         -------
@@ -1168,6 +1301,10 @@ class IndexOpsMixin(OpsMixin):
     def is_monotonic_decreasing(self) -> bool:
         """
         Return True if values in the object are monotonically decreasing.
+
+        This property checks whether each element is less than or equal to
+        the previous element. Equal consecutive values are considered
+        monotonically decreasing.
 
         Returns
         -------
@@ -1231,53 +1368,196 @@ class IndexOpsMixin(OpsMixin):
 
         v = self.array.nbytes
         if deep and is_object_dtype(self.dtype) and not PYPY:
-            values = cast(np.ndarray, self._values)
+            values = cast("np.ndarray", self._values)
             v += lib.memory_usage_of_objects(values)
         return v
 
-    @doc(
-        algorithms.factorize,
-        values="",
-        order="",
-        size_hint="",
-        sort=textwrap.dedent(
-            """\
-            sort : bool, default False
-                Sort `uniques` and shuffle `codes` to maintain the
-                relationship.
-            """
-        ),
-    )
     def factorize(
         self,
         sort: bool = False,
         use_na_sentinel: bool = True,
     ) -> tuple[npt.NDArray[np.intp], Index]:
+        """
+        Encode the object as an enumerated type or categorical variable.
+
+        This method is useful for obtaining a numeric representation of an
+        array when all that matters is identifying distinct values. `factorize`
+        is available as both a top-level function :func:`pandas.factorize`,
+        and as a method :meth:`Series.factorize` and :meth:`Index.factorize`.
+
+        Parameters
+        ----------
+        sort : bool, default False
+            Sort `uniques` and shuffle `codes` to maintain the
+            relationship.
+        use_na_sentinel : bool, default True
+            If True, the sentinel -1 will be used for NaN values. If False,
+            NaN values will be encoded as non-negative integers and will not drop the
+            NaN from the uniques of the values.
+
+        Returns
+        -------
+        codes : ndarray
+            An integer ndarray that's an indexer into `uniques`.
+            ``uniques.take(codes)`` will have the same values as `values`.
+        uniques : ndarray, Index, or Categorical
+            The unique valid values. When `values` is Categorical, `uniques`
+            is a Categorical. When `values` is some other pandas object, an
+            `Index` is returned. Otherwise, a 1-D ndarray is returned.
+
+            .. note::
+
+                Even if there's a missing value in `values`, `uniques` will
+                *not* contain an entry for it.
+
+        See Also
+        --------
+        cut : Discretize continuous-valued array.
+        unique : Find the unique value in an array.
+
+        Notes
+        -----
+        Reference :ref:`the user guide <reshaping.factorize>` for more examples.
+
+        Examples
+        --------
+        These examples all show factorize as a top-level method like
+        ``pd.factorize(values)``. The results are identical for methods like
+        :meth:`Series.factorize`.
+
+        >>> codes, uniques = pd.factorize(
+        ...     np.array(["b", "b", "a", "c", "b"], dtype="O")
+        ... )
+        >>> codes
+        array([0, 0, 1, 2, 0])
+        >>> uniques
+        array(['b', 'a', 'c'], dtype=object)
+
+        With ``sort=True``, the `uniques` will be sorted, and `codes` will be
+        shuffled so that the relationship is the maintained.
+
+        >>> codes, uniques = pd.factorize(
+        ...     np.array(["b", "b", "a", "c", "b"], dtype="O"), sort=True
+        ... )
+        >>> codes
+        array([1, 1, 0, 2, 1])
+        >>> uniques
+        array(['a', 'b', 'c'], dtype=object)
+
+        When ``use_na_sentinel=True`` (the default), missing values are indicated in
+        the `codes` with the sentinel value ``-1`` and missing values are not
+        included in `uniques`.
+
+        >>> codes, uniques = pd.factorize(
+        ...     np.array(["b", None, "a", "c", "b"], dtype="O")
+        ... )
+        >>> codes
+        array([ 0, -1,  1,  2,  0])
+        >>> uniques
+        array(['b', 'a', 'c'], dtype=object)
+
+        Thus far, we've only factorized lists (which are internally coerced to
+        NumPy arrays). When factorizing pandas objects, the type of `uniques`
+        will differ. For Categoricals, a `Categorical` is returned.
+
+        >>> cat = pd.Categorical(["a", "a", "c"], categories=["a", "b", "c"])
+        >>> codes, uniques = pd.factorize(cat)
+        >>> codes
+        array([0, 0, 1])
+        >>> uniques
+        ['a', 'c']
+        Categories (3, str): ['a', 'b', 'c']
+
+        Notice that ``'b'`` is in ``uniques.categories``, despite not being
+        present in ``cat.values``.
+
+        For all other pandas objects, an Index of the appropriate type is
+        returned.
+
+        >>> cat = pd.Series(["a", "a", "c"])
+        >>> codes, uniques = pd.factorize(cat)
+        >>> codes
+        array([0, 0, 1])
+        >>> uniques
+        Index(['a', 'c'], dtype='str')
+
+        If NaN is in the values, and we want to include NaN in the uniques of the
+        values, it can be achieved by setting ``use_na_sentinel=False``.
+
+        >>> values = np.array([1, 2, 1, np.nan])
+        >>> codes, uniques = pd.factorize(values)  # default: use_na_sentinel=True
+        >>> codes
+        array([ 0,  1,  0, -1])
+        >>> uniques
+        array([1., 2.])
+
+        >>> codes, uniques = pd.factorize(values, use_na_sentinel=False)
+        >>> codes
+        array([0, 1, 0, 2])
+        >>> uniques
+        array([ 1.,  2., nan])
+        """
         codes, uniques = algorithms.factorize(
             self._values, sort=sort, use_na_sentinel=use_na_sentinel
         )
         if uniques.dtype == np.float16:
             uniques = uniques.astype(np.float32)
 
-        if isinstance(self, ABCIndex):
-            # preserve e.g. MultiIndex
-            uniques = self._constructor(uniques)
+        if isinstance(self, ABCMultiIndex):
+            # preserve MultiIndex
+            if len(self) == 0:
+                # GH#57517
+                uniques = self[:0]
+            else:
+                uniques = self._constructor(uniques)
         else:
             from pandas import Index
 
-            uniques = Index(uniques)
+            try:
+                uniques = Index(uniques, dtype=self.dtype, copy=False)
+            except NotImplementedError:
+                # not all dtypes are supported in Index that are allowed for Series
+                # e.g. float16 or bytes
+                uniques = Index(uniques, copy=False)
         return codes, uniques
 
-    _shared_docs["searchsorted"] = """
+    # This overload is needed so that the call to searchsorted in
+    # pandas.core.resample.TimeGrouper._get_period_bins picks the correct result
+
+    # error: Overloaded function signatures 1 and 2 overlap with incompatible
+    # return types
+    @overload
+    def searchsorted(  # type: ignore[overload-overlap]
+        self,
+        value: ScalarLike_co,
+        side: Literal["left", "right"] = ...,
+        sorter: NumpySorter = ...,
+    ) -> np.intp: ...
+
+    @overload
+    def searchsorted(
+        self,
+        value: npt.ArrayLike | ExtensionArray,
+        side: Literal["left", "right"] = ...,
+        sorter: NumpySorter = ...,
+    ) -> npt.NDArray[np.intp]: ...
+
+    def searchsorted(
+        self,
+        value: NumpyValueArrayLike | ExtensionArray,
+        side: Literal["left", "right"] = "left",
+        sorter: NumpySorter | None = None,
+    ) -> npt.NDArray[np.intp] | np.intp:
+        """
         Find indices where elements should be inserted to maintain order.
 
-        Find the indices into a sorted {klass} `self` such that, if the
+        Find the indices into a sorted Index `self` such that, if the
         corresponding elements in `value` were inserted before the indices,
         the order of `self` would be preserved.
 
         .. note::
 
-            The {klass} *must* be monotonically sorted, otherwise
+            The Index *must* be monotonically sorted, otherwise
             wrong locations will likely be returned. Pandas does *not*
             check this for you.
 
@@ -1285,7 +1565,7 @@ class IndexOpsMixin(OpsMixin):
         ----------
         value : array-like or scalar
             Values to insert into `self`.
-        side : {{'left', 'right'}}, optional
+        side : {'left', 'right'}, optional
             If 'left', the index of the first suitable location found is given.
             If 'right', return the last such index.  If there is no suitable
             index, return either 0 or N (where N is the length of `self`).
@@ -1318,38 +1598,38 @@ class IndexOpsMixin(OpsMixin):
         dtype: int64
 
         >>> ser.searchsorted(4)
-        3
+        np.int64(3)
 
         >>> ser.searchsorted([0, 4])
         array([0, 3])
 
-        >>> ser.searchsorted([1, 3], side='left')
+        >>> ser.searchsorted([1, 3], side="left")
         array([0, 2])
 
-        >>> ser.searchsorted([1, 3], side='right')
+        >>> ser.searchsorted([1, 3], side="right")
         array([1, 3])
 
-        >>> ser = pd.Series(pd.to_datetime(['3/11/2000', '3/12/2000', '3/13/2000']))
+        >>> ser = pd.Series(pd.to_datetime(["3/11/2000", "3/12/2000", "3/13/2000"]))
         >>> ser
         0   2000-03-11
         1   2000-03-12
         2   2000-03-13
-        dtype: datetime64[ns]
+        dtype: datetime64[us]
 
-        >>> ser.searchsorted('3/14/2000')
-        3
+        >>> ser.searchsorted("3/14/2000")
+        np.int64(3)
 
         >>> ser = pd.Categorical(
-        ...     ['apple', 'bread', 'bread', 'cheese', 'milk'], ordered=True
+        ...     ["apple", "bread", "bread", "cheese", "milk"], ordered=True
         ... )
         >>> ser
         ['apple', 'bread', 'bread', 'cheese', 'milk']
-        Categories (4, object): ['apple' < 'bread' < 'cheese' < 'milk']
+        Categories (4, str): ['apple' < 'bread' < 'cheese' < 'milk']
 
-        >>> ser.searchsorted('bread')
-        1
+        >>> ser.searchsorted("bread")
+        np.int64(1)
 
-        >>> ser.searchsorted(['bread'], side='right')
+        >>> ser.searchsorted(["bread"], side="right")
         array([3])
 
         If the values are not monotonically sorted, wrong locations
@@ -1365,35 +1645,6 @@ class IndexOpsMixin(OpsMixin):
         >>> ser.searchsorted(1)  # doctest: +SKIP
         0  # wrong result, correct would be 1
         """
-
-    # This overload is needed so that the call to searchsorted in
-    # pandas.core.resample.TimeGrouper._get_period_bins picks the correct result
-
-    # error: Overloaded function signatures 1 and 2 overlap with incompatible
-    # return types
-    @overload
-    def searchsorted(  # type: ignore[overload-overlap]
-        self,
-        value: ScalarLike_co,
-        side: Literal["left", "right"] = ...,
-        sorter: NumpySorter = ...,
-    ) -> np.intp: ...
-
-    @overload
-    def searchsorted(
-        self,
-        value: npt.ArrayLike | ExtensionArray,
-        side: Literal["left", "right"] = ...,
-        sorter: NumpySorter = ...,
-    ) -> npt.NDArray[np.intp]: ...
-
-    @doc(_shared_docs["searchsorted"], klass="Index")
-    def searchsorted(
-        self,
-        value: NumpyValueArrayLike | ExtensionArray,
-        side: Literal["left", "right"] = "left",
-        sorter: NumpySorter | None = None,
-    ) -> npt.NDArray[np.intp] | np.intp:
         if isinstance(value, ABCDataFrame):
             msg = (
                 "Value must be 1-D array-like or scalar, "
@@ -1429,6 +1680,11 @@ class IndexOpsMixin(OpsMixin):
         res_name = ops.get_op_result_name(self, other)
 
         lvalues = self._values
+        if not isinstance(lvalues, ExtensionArray) or isinstance(other, range):
+            # For EA-backed values the warning is emitted by the EA's own
+            # _arith_method; the exception is ``range``, which is converted to
+            # an ndarray below before it reaches the EA (GH#62423).
+            ops.maybe_warn_listlike(other)
         rvalues = extract_array(other, extract_numpy=True, extract_range=True)
         rvalues = ops.maybe_prepare_scalar_for_op(rvalues, lvalues.shape)
         rvalues = ensure_wrapped_if_datetimelike(rvalues)
@@ -1438,9 +1694,9 @@ class IndexOpsMixin(OpsMixin):
         with np.errstate(all="ignore"):
             result = ops.arithmetic_op(lvalues, rvalues, op)
 
-        return self._construct_result(result, name=res_name)
+        return self._construct_result(result, name=res_name, other=other)
 
-    def _construct_result(self, result, name):
+    def _construct_result(self, result, name, other):
         """
         Construct an appropriately-wrapped result from the ArrayLike result
         of an arithmetic-like operation.

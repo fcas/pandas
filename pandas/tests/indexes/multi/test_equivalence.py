@@ -10,6 +10,7 @@ from pandas import (
     Series,
 )
 import pandas._testing as tm
+from pandas.core.indexes.frozen import FrozenList
 
 
 def test_equals(idx):
@@ -64,8 +65,8 @@ def test_equals_op(idx):
     with pytest.raises(ValueError, match="Lengths must match"):
         index_a == series_b
 
-    tm.assert_numpy_array_equal(index_a == series_a, expected1)
-    tm.assert_numpy_array_equal(index_a == series_c, expected2)
+    tm.assert_series_equal(index_a == series_a, Series(expected1))
+    tm.assert_series_equal(index_a == series_c, Series(expected2))
 
     # cases where length is 1 for one of them
     with pytest.raises(ValueError, match="Lengths must match"):
@@ -223,7 +224,7 @@ def test_equals_missing_values_differently_sorted():
 
 
 def test_is_():
-    mi = MultiIndex.from_tuples(zip(range(10), range(10)))
+    mi = MultiIndex.from_tuples(zip(range(10), range(10), strict=True))
     assert mi.is_(mi)
     assert mi.is_(mi.view())
     assert mi.is_(mi.view().view().view().view())
@@ -282,3 +283,13 @@ def test_equals_ea_int_regular_int():
     mi2 = MultiIndex.from_arrays([[1, 2], [3, 4]])
     assert not mi1.equals(mi2)
     assert not mi2.equals(mi1)
+
+
+def test_multiindex_equals_different_bit_widths():
+    # GH#65700 - MultiIndex.equals should be value-based, not byte-based.
+    # There is no user-facing way to construct cross-dtype codes naturally;
+    # this reproduces the internal regression found in #65192.
+    midx1 = MultiIndex.from_product([["a", "b", "c"], [1, 2]])
+    midx2 = MultiIndex.from_product([["a", "b", "c"], [1, 2]])
+    midx2._codes = FrozenList([midx2.codes[0].astype("int64"), midx2.codes[1]])
+    assert midx1.equals(midx2)

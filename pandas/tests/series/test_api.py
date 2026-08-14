@@ -81,8 +81,8 @@ class TestSeriesMisc:
             Index(np.arange(10), dtype=np.float64),
             Index([True, False]),
             Index([f"a{i}" for i in range(101)]),
-            pd.MultiIndex.from_tuples(zip("ABCD", "EFGH")),
-            pd.MultiIndex.from_tuples(zip([0, 1, 2, 3], "EFGH")),
+            pd.MultiIndex.from_tuples(zip("ABCD", "EFGH", strict=True)),
+            pd.MultiIndex.from_tuples(zip([0, 1, 2, 3], "EFGH", strict=True)),
         ],
     )
     def test_index_tab_completion(self, index):
@@ -162,7 +162,6 @@ class TestSeriesMisc:
 
     def test_inspect_getmembers(self):
         # GH38782
-        pytest.importorskip("jinja2")
         ser = Series(dtype=object)
         inspect.getmembers(ser)
 

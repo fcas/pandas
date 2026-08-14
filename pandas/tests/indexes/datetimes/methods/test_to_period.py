@@ -1,7 +1,8 @@
+from datetime import UTC
+
 import dateutil.tz
 from dateutil.tz import tzlocal
 import pytest
-import pytz
 
 from pandas._libs.tslibs.ccalendar import MONTHS
 from pandas._libs.tslibs.offsets import MonthEnd
@@ -11,6 +12,7 @@ from pandas import (
     DatetimeIndex,
     Period,
     PeriodIndex,
+    Series,
     Timestamp,
     date_range,
     period_range,
@@ -62,6 +64,75 @@ class TestToPeriod:
         prng = rng.to_period()
         assert prng.freq == "YE-DEC"
 
+    @pytest.mark.parametrize(
+        "off, expected_freq",
+        [
+            ("QS-APR", "Q-MAR"),
+            ("BQS-APR", "Q-MAR"),
+            ("BQE-APR", "Q-APR"),
+            # start-offset month is shifted back one; JAN wraps to DEC
+            ("QS-JAN", "Q-DEC"),
+            ("QS-DEC", "Q-NOV"),
+        ],
+    )
+    def test_to_period_quarterly_anchored(self, off, expected_freq):
+        # GH#36939 - anchored quarter offsets should preserve the anchor
+        rng = date_range("01-Apr-2012", periods=4, freq=off)
+        result = rng.to_period()
+        assert result.freqstr == expected_freq
+
+    @pytest.mark.parametrize(
+        "dates, expected_freq, expected_periods",
+        [
+            (
+                ["2012-01-01", "2012-04-01", "2012-07-01", "2012-10-01"],
+                "Q-DEC",
+                ["2012Q1", "2012Q2", "2012Q3", "2012Q4"],
+            ),
+            (
+                ["2012-02-01", "2012-05-01", "2012-08-01", "2012-11-01"],
+                "Q-JAN",
+                ["2013Q1", "2013Q2", "2013Q3", "2013Q4"],
+            ),
+            (
+                ["2012-03-01", "2012-06-01", "2012-09-01", "2012-12-01"],
+                "Q-FEB",
+                ["2013Q1", "2013Q2", "2013Q3", "2013Q4"],
+            ),
+        ],
+    )
+    def test_to_period_quarter_start_inferred(
+        self, dates, expected_freq, expected_periods
+    ):
+        # GH#36939 - without a set freq the anchor is only inferred up to
+        #  mod 3; calendar quarter starts must keep the calendar Q-DEC labels
+        dti = DatetimeIndex(dates)
+        result = dti.to_period()
+        expected = PeriodIndex(expected_periods, freq=expected_freq)
+        tm.assert_index_equal(result, expected)
+
+        # Series.dt.to_period goes through DatetimeArray.to_period, which
+        #  infers the freq itself rather than receiving it from the Index
+        result2 = Series(dti).dt.to_period()
+        tm.assert_series_equal(result2, Series(expected))
+
+    @pytest.mark.parametrize(
+        "off, expected_freq",
+        [
+            ("YS-APR", "Y-MAR"),
+            ("BYS-APR", "Y-MAR"),
+            ("BYE-APR", "Y-APR"),
+            # start-offset month is shifted back one; JAN wraps to DEC
+            ("YS-JAN", "Y-DEC"),
+            ("YS-DEC", "Y-NOV"),
+        ],
+    )
+    def test_to_period_annual_anchored(self, off, expected_freq):
+        # GH#36939 - anchored annual offsets should preserve the anchor
+        rng = date_range("01-Apr-2012", periods=3, freq=off)
+        result = rng.to_period()
+        assert result.freqstr == expected_freq
+
     def test_to_period_monthish(self):
         offsets = ["MS", "BME"]
         for off in offsets:
@@ -90,24 +161,14 @@ class TestToPeriod:
         tm.assert_index_equal(pi, period_range("2020-01", "2020-05", freq=freq_period))
 
     @pytest.mark.parametrize(
-        "freq, freq_depr",
-        [
-            ("2ME", "2M"),
-            ("2QE", "2Q"),
-            ("2QE-SEP", "2Q-SEP"),
-            ("1YE", "1Y"),
-            ("2YE-MAR", "2Y-MAR"),
-        ],
+        "freq", ["2ME", "1me", "2QE", "2QE-SEP", "1YE", "ye", "2YE-MAR"]
     )
-    def test_to_period_frequency_M_Q_Y_deprecated(self, freq, freq_depr):
-        # GH#9586
-        msg = f"'{freq_depr[1:]}' is deprecated and will be removed "
-        f"in a future version, please use '{freq[1:]}' instead."
+    def test_to_period_frequency_M_Q_Y_raises(self, freq):
+        msg = f"Invalid frequency: {freq}"
 
-        rng = date_range("01-Jan-2012", periods=8, freq=freq)
-        prng = rng.to_period()
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            assert prng.freq == freq_depr
+        rng = date_range("01-Jan-2012", periods=8, freq="ME")
+        with pytest.raises(ValueError, match=msg):
+            rng.to_period(freq)
 
     def test_to_period_infer(self):
         # https://github.com/pandas-dev/pandas/issues/33358
@@ -127,13 +188,13 @@ class TestToPeriod:
 
     @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
     def test_period_dt64_round_trip(self):
-        dti = date_range("1/1/2000", "1/7/2002", freq="B")
+        dti = date_range("1/1/2000", "1/7/2002", freq="B", unit="ns")
         pi = dti.to_period()
-        tm.assert_index_equal(pi.to_timestamp(), dti)
+        tm.assert_index_equal(pi.to_timestamp(), dti.as_unit("us"))
 
-        dti = date_range("1/1/2000", "1/7/2002", freq="B")
+        dti = date_range("1/1/2000", "1/7/2002", freq="B", unit="ns")
         pi = dti.to_period(freq="h")
-        tm.assert_index_equal(pi.to_timestamp(), dti)
+        tm.assert_index_equal(pi.to_timestamp(), dti.as_unit("us"))
 
     def test_to_period_millisecond(self):
         index = DatetimeIndex(
@@ -165,7 +226,13 @@ class TestToPeriod:
 
     @pytest.mark.parametrize(
         "tz",
-        ["US/Eastern", pytz.utc, tzlocal(), "dateutil/US/Eastern", dateutil.tz.tzutc()],
+        [
+            "US/Eastern",
+            UTC,
+            tzlocal(),
+            "dateutil/US/Eastern",
+            dateutil.tz.tzutc(),
+        ],
     )
     def test_to_period_tz(self, tz):
         ts = date_range("1/1/2000", "2/1/2000", tz=tz)
@@ -208,10 +275,16 @@ class TestToPeriod:
         assert idx.freqstr is None
         tm.assert_index_equal(idx.to_period(), expected)
 
-    @pytest.mark.parametrize("freq", ["2BMS", "1SME-15"])
+    @pytest.mark.parametrize("freq", ["2BME", "SME-15", "2BMS"])
     def test_to_period_offsets_not_supported(self, freq):
         # GH#56243
-        msg = f"{freq[1:]} is not supported as period frequency"
+        msg = "|".join(
+            [
+                f"Invalid frequency: {freq}",
+                f"{freq} is not supported as period frequency",
+            ]
+        )
+
         ts = date_range("1/1/2012", periods=4, freq=freq)
         with pytest.raises(ValueError, match=msg):
             ts.to_period()

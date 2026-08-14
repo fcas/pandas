@@ -4,6 +4,8 @@ import operator
 import numpy as np
 import pytest
 
+from pandas.compat import HAS_PYARROW
+
 from pandas import (
     DataFrame,
     Index,
@@ -150,14 +152,14 @@ class TestSeriesLogicalOps:
         tm.assert_series_equal(result, expected)
 
         s_abNd = Series(["a", "b", np.nan, "d"])
-        if using_infer_string:
-            import pyarrow as pa
-
-            with pytest.raises(pa.lib.ArrowNotImplementedError, match="has no kernel"):
-                s_0123 & s_abNd
+        # pyarrow-backed str routes through the pandas op; object dtype and the
+        # python-backed str fallback hit the Python operator instead
+        if using_infer_string and HAS_PYARROW:
+            msg = "'rand_' not supported"
         else:
-            with pytest.raises(TypeError, match="unsupported.* 'int' and 'str'"):
-                s_0123 & s_abNd
+            msg = r"unsupported operand type\(s\) for &: 'int' and 'str'"
+        with pytest.raises(TypeError, match=msg):
+            s_0123 & s_abNd
 
     def test_logical_operators_bool_dtype_with_int(self):
         index = list("bca")
@@ -270,7 +272,7 @@ class TestSeriesLogicalOps:
         s[::2] = np.nan
         d = DataFrame({"A": s})
 
-        expected = DataFrame(False, index=range(9), columns=["A"] + list(range(9)))
+        expected = DataFrame(False, index=range(9), columns=["A", *list(range(9))])
 
         result = s & d
         tm.assert_frame_equal(result, expected)
@@ -413,15 +415,16 @@ class TestSeriesLogicalOps:
             tm.assert_series_equal(result, a[a])
 
         for e in [Series(["z"])]:
-            warn = FutureWarning if using_infer_string else None
             if using_infer_string:
-                import pyarrow as pa
-
-                with tm.assert_produces_warning(warn, match="Operation between non"):
-                    with pytest.raises(
-                        pa.lib.ArrowNotImplementedError, match="has no kernel"
-                    ):
-                        result = a[a | e]
+                # TODO(infer_string) should this behave differently?
+                # -> https://github.com/pandas-dev/pandas/issues/60234
+                with pytest.raises(
+                    TypeError,
+                    match="|".join(
+                        ["not supported for dtype", "unsupported operand type"]
+                    ),
+                ):
+                    result = a[a | e]
             else:
                 result = a[a | e]
             tm.assert_series_equal(result, a[a])
@@ -514,19 +517,3 @@ class TestSeriesLogicalOps:
 
         result = ser1 ^ ser2
         tm.assert_series_equal(result, expected)
-
-    def test_pyarrow_numpy_string_invalid(self):
-        # GH#56008
-        pytest.importorskip("pyarrow")
-        ser = Series([False, True])
-        ser2 = Series(["a", "b"], dtype="string[pyarrow_numpy]")
-        result = ser == ser2
-        expected = Series(False, index=ser.index)
-        tm.assert_series_equal(result, expected)
-
-        result = ser != ser2
-        expected = Series(True, index=ser.index)
-        tm.assert_series_equal(result, expected)
-
-        with pytest.raises(TypeError, match="Invalid comparison"):
-            ser > ser2

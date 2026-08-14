@@ -4,9 +4,11 @@ Extend pandas with custom array types.
 
 from __future__ import annotations
 
+import inspect
 from typing import (
     TYPE_CHECKING,
     Any,
+    Self,
     TypeVar,
     cast,
     overload,
@@ -18,6 +20,7 @@ from pandas._libs import missing as libmissing
 from pandas._libs.hashtable import object_hash
 from pandas._libs.properties import cache_readonly
 from pandas.errors import AbstractMethodError
+from pandas.util._decorators import set_module
 
 from pandas.core.dtypes.generic import (
     ABCDataFrame,
@@ -28,7 +31,6 @@ from pandas.core.dtypes.generic import (
 if TYPE_CHECKING:
     from pandas._typing import (
         DtypeObj,
-        Self,
         Shape,
         npt,
         type_t,
@@ -41,9 +43,29 @@ if TYPE_CHECKING:
     ExtensionDtypeT = TypeVar("ExtensionDtypeT", bound="ExtensionDtype")
 
 
+@set_module("pandas.api.extensions")
 class ExtensionDtype:
     """
     A custom data type, to be paired with an ExtensionArray.
+
+    This enables support for third-party and custom dtypes within the
+    pandas ecosystem. By implementing this interface and pairing it with a custom
+    `ExtensionArray`, users can create rich data types that integrate cleanly
+    with pandas operations, such as grouping, joining, or aggregation.
+
+    Attributes
+    ----------
+    kind
+    na_value
+    name
+    names
+    type
+
+    Methods
+    -------
+    construct_array_type
+    construct_from_string
+    is_dtype
 
     See Also
     --------
@@ -141,7 +163,7 @@ class ExtensionDtype:
         return False
 
     def __hash__(self) -> int:
-        # for python>=3.10, different nan objects have different hashes
+        # different nan objects have different hashes
         # we need to avoid that and thus use hash function with old behavior
         return object_hash(tuple(getattr(self, attr) for attr in self._metadata))
 
@@ -206,8 +228,7 @@ class ExtensionDtype:
         """
         return None
 
-    @classmethod
-    def construct_array_type(cls) -> type_t[ExtensionArray]:
+    def construct_array_type(self) -> type_t[ExtensionArray]:
         """
         Return the array type associated with this dtype.
 
@@ -215,7 +236,7 @@ class ExtensionDtype:
         -------
         type
         """
-        raise AbstractMethodError(cls)
+        raise AbstractMethodError(self)
 
     def empty(self, shape: Shape) -> ExtensionArray:
         """
@@ -283,9 +304,15 @@ class ExtensionDtype:
             raise TypeError(
                 f"'construct_from_string' expects a string, got {type(string)}"
             )
+        if not isinstance(cls.name, str):
+            # GH#46093 registered ExtensionDtype without a string `name`
+            raise TypeError(
+                f"Cannot construct a '{cls.__name__}' from a string because it "
+                "does not define a string 'name' attribute. ExtensionDtype "
+                "subclasses must set a class-level `name`."
+            )
         # error: Non-overlapping equality check (left operand type: "str", right
         #  operand type: "Callable[[ExtensionDtype], str]")  [comparison-overlap]
-        assert isinstance(cls.name, str), (cls, type(cls.name))
         if string != cls.name:
             raise TypeError(f"Cannot construct a '{cls.__name__}' from '{string}'")
         return cls()
@@ -451,8 +478,8 @@ class StorageExtensionDtype(ExtensionDtype):
     name: str
     _metadata = ("storage",)
 
-    def __init__(self, storage: str | None = None) -> None:
-        self.storage = storage
+    def __init__(self, storage: str) -> None:
+        self._storage = storage
 
     def __repr__(self) -> str:
         return f"{self.name}[{self.storage}]"
@@ -473,7 +500,12 @@ class StorageExtensionDtype(ExtensionDtype):
     def na_value(self) -> libmissing.NAType:
         return libmissing.NA
 
+    @property
+    def storage(self) -> str:
+        return self._storage
 
+
+@set_module("pandas.api.extensions")
 def register_extension_dtype(cls: type_t[ExtensionDtypeT]) -> type_t[ExtensionDtypeT]:
     """
     Register an ExtensionType with pandas as class decorator.
@@ -501,6 +533,14 @@ def register_extension_dtype(cls: type_t[ExtensionDtypeT]) -> type_t[ExtensionDt
     ... class MyExtensionDtype(ExtensionDtype):
     ...     name = "myextension"
     """
+    # GH#46093 identity check against the base property, so dtypes defining
+    #  ``name`` as an instance-level property (e.g. DatetimeTZDtype) pass.
+    if inspect.getattr_static(cls, "name", None) is ExtensionDtype.__dict__["name"]:
+        raise TypeError(
+            f"Cannot register '{cls.__name__}' because it does not define a "
+            "string 'name' attribute. ExtensionDtype subclasses must set a "
+            "class-level `name`."
+        )
     _registry.register(cls)
     return cls
 
@@ -509,7 +549,7 @@ class Registry:
     """
     Registry for dtype inference.
 
-    The registry allows one to map a string repr of a extension
+    The registry allows one to map a string repr of an extension
     dtype to an extension dtype. The string alias can be used in several
     places, including
 

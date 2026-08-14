@@ -1,4 +1,5 @@
 import decimal
+import re
 
 import numpy as np
 from numpy import iinfo
@@ -43,11 +44,21 @@ def multiple_elts(request):
     return request.param
 
 
+def _to_numpy_array(x):
+    import warnings
+
+    from pandas.errors import Pandas4Warning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*values.*", category=Pandas4Warning)
+        return np.array(Index(x).values)
+
+
 @pytest.fixture(
     params=[
         (lambda x: Index(x, name="idx"), tm.assert_index_equal),
         (lambda x: Series(x, name="ser"), tm.assert_series_equal),
-        (lambda x: np.array(Index(x).values), tm.assert_numpy_array_equal),
+        (_to_numpy_array, tm.assert_numpy_array_equal),
     ]
 )
 def transform_assert_equal(request):
@@ -102,10 +113,10 @@ def test_series_numeric(data):
 @pytest.mark.parametrize(
     "data,msg",
     [
-        ([1, -3.14, "apple"], 'Unable to parse string "apple" at position 2'),
+        ([1, -3.14, "apple"], "Unable to parse string 'apple' at position 2"),
         (
             ["orange", 1, -3.14, "apple"],
-            'Unable to parse string "orange" at position 0',
+            "Unable to parse string 'orange' at position 0",
         ),
     ],
 )
@@ -114,6 +125,27 @@ def test_error(data, msg):
 
     with pytest.raises(ValueError, match=msg):
         to_numeric(ser, errors="raise")
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # repr()-ing the value itself would carry the numpy wrapper type into
+        # the message, e.g. np.str_('apple')
+        (np.str_("apple"), "'apple'"),
+        (np.bytes_(b"apple"), "b'apple'"),
+        # decoding the bytes to name them would raise on this one
+        (b"\xff\xfe", r"b'\xff\xfe'"),
+    ],
+)
+def test_error_names_the_value_exactly(value, expected):
+    # GH#66524 - the message names the underlying value, so it is neither
+    # widened to the type of the object holding it nor narrowed by a decode.
+    ser = Series([value], dtype=object)
+
+    msg = re.escape(f"Unable to parse string {expected} at position 0")
+    with pytest.raises(ValueError, match=msg):
+        to_numeric(ser)
 
 
 def test_ignore_error():
@@ -127,7 +159,7 @@ def test_ignore_error():
 @pytest.mark.parametrize(
     "errors,exp",
     [
-        ("raise", 'Unable to parse string "apple" at position 2'),
+        ("raise", "Unable to parse string 'apple' at position 2"),
         # Coerces to float.
         ("coerce", [1.0, 0.0, np.nan]),
     ],
@@ -192,7 +224,7 @@ def test_numeric_df_columns(columns):
     # see gh-14827
     df = DataFrame(
         {
-            "a": [1.2, decimal.Decimal(3.14), decimal.Decimal("infinity"), "0.1"],
+            "a": [1.2, decimal.Decimal("3.14"), decimal.Decimal("infinity"), "0.1"],
             "b": [1.0, 2.0, 3.0, 4.0],
         }
     )
@@ -207,10 +239,10 @@ def test_numeric_df_columns(columns):
     "data,exp_data",
     [
         (
-            [[decimal.Decimal(3.14), 1.0], decimal.Decimal(1.6), 0.1],
+            [[decimal.Decimal("3.14"), 1.0], decimal.Decimal("1.6"), 0.1],
             [[3.14, 1.0], 1.6, 0.1],
         ),
-        ([np.array([decimal.Decimal(3.14), 1.0]), 0.1], [[3.14, 1.0], 0.1]),
+        ([np.array([decimal.Decimal("3.14"), 1.0]), 0.1], [[3.14, 1.0], 0.1]),
     ],
 )
 def test_numeric_embedded_arr_likes(data, exp_data):
@@ -250,15 +282,9 @@ def test_really_large_scalar(large_val, signed, transform, errors):
     val = -large_val if signed else large_val
 
     val = transform(val)
-    val_is_string = isinstance(val, str)
 
-    if val_is_string and errors in (None, "raise"):
-        msg = "Integer out of range. at position 0"
-        with pytest.raises(ValueError, match=msg):
-            to_numeric(val, **kwargs)
-    else:
-        expected = float(val) if (errors == "coerce" and val_is_string) else val
-        tm.assert_almost_equal(to_numeric(val, **kwargs), expected)
+    expected = float(val) if errors == "coerce" else int(val)
+    tm.assert_almost_equal(to_numeric(val, **kwargs), expected)
 
 
 def test_really_large_in_arr(large_val, signed, transform, multiple_elts, errors):
@@ -270,21 +296,17 @@ def test_really_large_in_arr(large_val, signed, transform, multiple_elts, errors
     extra_elt = "string"
     arr = [val] + multiple_elts * [extra_elt]
 
-    val_is_string = isinstance(val, str)
     coercing = errors == "coerce"
 
-    if errors in (None, "raise") and (val_is_string or multiple_elts):
-        if val_is_string:
-            msg = "Integer out of range. at position 0"
-        else:
-            msg = 'Unable to parse string "string" at position 1'
+    if errors in (None, "raise") and multiple_elts:
+        msg = "Unable to parse string 'string' at position 1"
 
         with pytest.raises(ValueError, match=msg):
             to_numeric(arr, **kwargs)
     else:
         result = to_numeric(arr, **kwargs)
 
-        exp_val = float(val) if (coercing and val_is_string) else val
+        exp_val = float(val) if (coercing) else int(val)
         expected = [exp_val]
 
         if multiple_elts:
@@ -295,7 +317,7 @@ def test_really_large_in_arr(large_val, signed, transform, multiple_elts, errors
                 expected.append(extra_elt)
                 exp_dtype = object
         else:
-            exp_dtype = float if isinstance(exp_val, (int, float)) else object
+            exp_dtype = float if isinstance(exp_val, float) else object
 
         tm.assert_almost_equal(result, np.array(expected, dtype=exp_dtype))
 
@@ -311,24 +333,17 @@ def test_really_large_in_arr_consistent(large_val, signed, multiple_elts, errors
     if multiple_elts:
         arr.insert(0, large_val)
 
-    if errors in (None, "raise"):
-        index = int(multiple_elts)
-        msg = f"Integer out of range. at position {index}"
+    result = to_numeric(arr, **kwargs)
+    expected = [float(i) if errors == "coerce" else int(i) for i in arr]
+    exp_dtype = float if errors == "coerce" else object
 
-        with pytest.raises(ValueError, match=msg):
-            to_numeric(arr, **kwargs)
-    else:
-        result = to_numeric(arr, **kwargs)
-        expected = [float(i) for i in arr]
-        exp_dtype = float
-
-        tm.assert_almost_equal(result, np.array(expected, dtype=exp_dtype))
+    tm.assert_almost_equal(result, np.array(expected, dtype=exp_dtype))
 
 
 @pytest.mark.parametrize(
     "errors,checker",
     [
-        ("raise", 'Unable to parse string "fail" at position 0'),
+        ("raise", "Unable to parse string 'fail' at position 0"),
         ("coerce", lambda x: np.isnan(x)),
     ],
 )
@@ -366,6 +381,7 @@ def test_str(data, exp, transform_assert_equal):
     assert_equal(result, expected)
 
 
+@pytest.mark.filterwarnings("ignore:Series.values:pandas.errors.Pandas4Warning")
 def test_datetime_like(tz_naive_fixture, transform_assert_equal):
     transform, assert_equal = transform_assert_equal
     idx = pd.date_range("20130101", periods=3, tz=tz_naive_fixture)
@@ -382,6 +398,22 @@ def test_timedelta(transform_assert_equal):
     result = to_numeric(transform(idx))
     expected = transform(idx.asi8)
     assert_equal(result, expected)
+
+
+@pytest.mark.filterwarnings("ignore:Series.values:pandas.errors.Pandas4Warning")
+@pytest.mark.parametrize(
+    "scalar",
+    [
+        pd.Timedelta(1, "D"),
+        pd.Timestamp("2017-01-01T12"),
+        pd.Timestamp("2017-01-01T12", tz="US/Pacific"),
+    ],
+)
+def test_timedelta_timestamp_scalar(scalar):
+    # GH#59944
+    result = to_numeric(scalar)
+    expected = to_numeric(Series(scalar))[0]
+    assert result == expected
 
 
 def test_period(request, transform_assert_equal):
@@ -688,11 +720,11 @@ def test_precision_float_conversion(strrep):
 @pytest.mark.parametrize(
     "values, expected",
     [
-        (["1", "2", None], Series([1, 2, np.nan], dtype="Int64")),
+        (["1", "2", None], Series([1, 2, pd.NA], dtype="Int64")),
         (["1", "2", "3"], Series([1, 2, 3], dtype="Int64")),
         (["1", "2", 3], Series([1, 2, 3], dtype="Int64")),
         (["1", "2", 3.5], Series([1, 2, 3.5], dtype="Float64")),
-        (["1", None, 3.5], Series([1, np.nan, 3.5], dtype="Float64")),
+        (["1", None, 3.5], Series([1, pd.NA, 3.5], dtype="Float64")),
         (["1", "2", "3.5"], Series([1, 2, 3.5], dtype="Float64")),
     ],
 )
@@ -883,7 +915,7 @@ def test_to_numeric_dtype_backend_error(dtype_backend):
         dtype = "double[pyarrow]"
     else:
         dtype = "Float64"
-    expected = Series([np.nan, np.nan, np.nan], dtype=dtype)
+    expected = Series([pd.NA, pd.NA, pd.NA], dtype=dtype)
     tm.assert_series_equal(result, expected)
 
 
@@ -904,3 +936,37 @@ def test_coerce_pyarrow_backend():
     result = to_numeric(ser, errors="coerce", dtype_backend="pyarrow")
     expected = Series([1, 2, None], dtype=ArrowDtype(pa.int64()))
     tm.assert_series_equal(result, expected)
+
+
+def test_large_exponent_coerce():
+    # GH#63650 - exponent overflow in precise_xstrtod should not segfault
+    ser = Series(["1E3000000000"])
+    result = to_numeric(ser, errors="coerce")
+    expected = Series([np.inf])
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1.5\x00xyz",
+        "1e3\x00xyz",
+        "inf\x00xyz",
+        # the long spelling takes a different arm of the infinity check
+        "infinity\x00xyz",
+        # bytes take a different branch for deriving the length than str
+        b"1.5\x00xyz",
+        b"infinity\x00x",
+    ],
+)
+def test_embedded_nul_is_not_a_float(value):
+    # GH#66524 - the float parser stopped at an embedded NUL and reported the
+    # string fully consumed, so the trailing bytes were silently discarded.
+    # The message must name the whole value, not just the part before the NUL.
+    ser = Series([value])
+    msg = re.escape(f"Unable to parse string {value!r} at position 0")
+    with pytest.raises(ValueError, match=msg):
+        to_numeric(ser)
+
+    result = to_numeric(ser, errors="coerce")
+    tm.assert_series_equal(result, Series([np.nan]))

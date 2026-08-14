@@ -1,5 +1,6 @@
+from datetime import UTC
+
 import numpy as np
-from pytz import UTC
 
 from pandas._libs.tslibs.tzconversion import tz_localize_to_utc
 

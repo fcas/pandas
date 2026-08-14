@@ -291,11 +291,7 @@ def test_center_ljust_rjust_mixed_object():
 
 
 def test_center_ljust_rjust_fillchar(any_string_dtype):
-    if any_string_dtype == "string[pyarrow_numpy]":
-        pytest.skip(
-            "Arrow logic is different, "
-            "see https://github.com/pandas-dev/pandas/pull/54533/files#r1299808126",
-        )
+    # GH#54533, GH#54792
     s = Series(["a", "bb", "cccc", "ddddd", "eeeeee"], dtype=any_string_dtype)
 
     result = s.str.center(5, fillchar="X")
@@ -372,6 +368,20 @@ def test_zfill(any_string_dtype):
     expected = Series(
         ["00001", np.nan, "00aaa", np.nan, "45678"], dtype=any_string_dtype
     )
+    tm.assert_series_equal(result, expected)
+
+
+def test_zfill_signed(any_string_dtype):
+    s = Series(["-3", "+7", "-", "0"], dtype=any_string_dtype)
+    result = s.str.zfill(5)
+    expected = Series(["-0003", "+0007", "-0000", "00000"], dtype=any_string_dtype)
+    tm.assert_series_equal(result, expected)
+
+
+def test_zfill_all_null(any_string_dtype):
+    s = Series([None, None], dtype=any_string_dtype)
+    result = s.str.zfill(5)
+    expected = Series([None, None], dtype=any_string_dtype)
     tm.assert_series_equal(result, expected)
 
 

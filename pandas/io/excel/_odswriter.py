@@ -6,8 +6,6 @@ import json
 from typing import (
     TYPE_CHECKING,
     Any,
-    DefaultDict,
-    cast,
     overload,
 )
 
@@ -34,7 +32,7 @@ class ODSWriter(ExcelWriter):
     _engine = "odf"
     _supported_extensions = (".ods",)
 
-    def __init__(
+    def __init__(  # pyright: ignore[reportInconsistentConstructor]
         self,
         path: FilePath | WriteExcelBuffer | ExcelWriter,
         engine: str | None = None,
@@ -99,10 +97,15 @@ class ODSWriter(ExcelWriter):
         startrow: int = 0,
         startcol: int = 0,
         freeze_panes: tuple[int, int] | None = None,
+        autofilter_range: str | None = None,
     ) -> None:
         """
         Write the frame cells using odf
         """
+
+        if autofilter_range:
+            raise ValueError("Autofilter is not supported with odf!")
+
         from odf.table import (
             Table,
             TableCell,
@@ -120,14 +123,13 @@ class ODSWriter(ExcelWriter):
             self.book.spreadsheet.addElement(wks)
 
         if validate_freeze_panes(freeze_panes):
-            freeze_panes = cast(tuple[int, int], freeze_panes)
             self._create_freeze_panes(sheet_name, freeze_panes)
 
         for _ in range(startrow):
             wks.addElement(TableRow())
 
-        rows: DefaultDict = defaultdict(TableRow)
-        col_count: DefaultDict = defaultdict(int)
+        rows: defaultdict = defaultdict(TableRow)
+        col_count: defaultdict = defaultdict(int)
 
         for cell in sorted(cells, key=lambda cell: (cell.row, cell.col)):
             # only add empty cells if the row is still empty
@@ -246,7 +248,7 @@ class ODSWriter(ExcelWriter):
     def _process_style(self, style: None) -> None: ...
 
     def _process_style(self, style: dict[str, Any] | None) -> str | None:
-        """Convert a style dictionary to a OpenDocument style sheet
+        """Convert a style dictionary to an OpenDocument style sheet
 
         Parameters
         ----------
@@ -270,7 +272,7 @@ class ODSWriter(ExcelWriter):
         style_key = json.dumps(style)
         if style_key in self._style_dict:
             return self._style_dict[style_key]
-        name = f"pd{len(self._style_dict)+1}"
+        name = f"pd{len(self._style_dict) + 1}"
         self._style_dict[style_key] = name
         odf_style = Style(name=name, family="table-cell")
         if "font" in style:

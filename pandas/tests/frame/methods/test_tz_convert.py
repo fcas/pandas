@@ -1,3 +1,5 @@
+import zoneinfo
+
 import numpy as np
 import pytest
 
@@ -13,28 +15,34 @@ import pandas._testing as tm
 
 class TestTZConvert:
     def test_tz_convert(self, frame_or_series):
-        rng = date_range("1/1/2011", periods=200, freq="D", tz="US/Eastern")
+        rng = date_range(
+            "1/1/2011", periods=200, freq="D", tz=zoneinfo.ZoneInfo("US/Eastern")
+        )
 
         obj = DataFrame({"a": 1}, index=rng)
         obj = tm.get_obj(obj, frame_or_series)
 
-        result = obj.tz_convert("Europe/Berlin")
-        expected = DataFrame({"a": 1}, rng.tz_convert("Europe/Berlin"))
+        berlin = zoneinfo.ZoneInfo("Europe/Berlin")
+        result = obj.tz_convert(berlin)
+        expected = DataFrame({"a": 1}, rng.tz_convert(berlin))
         expected = tm.get_obj(expected, frame_or_series)
 
-        assert result.index.tz.zone == "Europe/Berlin"
+        assert result.index.tz.key == "Europe/Berlin"
         tm.assert_equal(result, expected)
 
     def test_tz_convert_axis1(self):
-        rng = date_range("1/1/2011", periods=200, freq="D", tz="US/Eastern")
+        rng = date_range(
+            "1/1/2011", periods=200, freq="D", tz=zoneinfo.ZoneInfo("US/Eastern")
+        )
 
         obj = DataFrame({"a": 1}, index=rng)
 
         obj = obj.T
-        result = obj.tz_convert("Europe/Berlin", axis=1)
-        assert result.columns.tz.zone == "Europe/Berlin"
+        berlin = zoneinfo.ZoneInfo("Europe/Berlin")
+        result = obj.tz_convert(berlin, axis=1)
+        assert result.columns.tz.key == "Europe/Berlin"
 
-        expected = DataFrame({"a": 1}, rng.tz_convert("Europe/Berlin"))
+        expected = DataFrame({"a": 1}, rng.tz_convert(berlin))
 
         tm.assert_equal(result, expected.T)
 
@@ -69,12 +77,6 @@ class TestTZConvert:
             # MultiIndex
             # GH7846
             df2 = DataFrame(np.ones(5), MultiIndex.from_arrays([l0, l1]))
-
-            # freq is not preserved in MultiIndex construction
-            l1_expected = l1_expected._with_freq(None)
-            l0_expected = l0_expected._with_freq(None)
-            l1 = l1._with_freq(None)
-            l0 = l0._with_freq(None)
 
             df3 = getattr(df2, fn)("US/Pacific", level=0)
             assert not df3.index.levels[0].equals(l0)

@@ -63,8 +63,8 @@ class TestFactorize:
         expected_uniques = np.array([(1 + 0j), (2 + 0j), (2 + 1j)], dtype=complex)
         tm.assert_numpy_array_equal(uniques, expected_uniques)
 
-    def test_factorize(self, index_or_series_obj, sort):
-        obj = index_or_series_obj
+    def test_factorize(self, index_or_series_obj_orderable, sort):
+        obj = index_or_series_obj_orderable
         result_codes, result_uniques = obj.factorize(sort=sort)
 
         constructor = Index
@@ -435,7 +435,7 @@ class TestFactorize:
                 np.array(["b", "a"], dtype=object),
             ),
             (
-                pd.array([2, 1, np.nan, 2], dtype="Int64"),
+                pd.array([2, 1, pd.NA, 2], dtype="Int64"),
                 pd.array([2, 1], dtype="Int64"),
             ),
         ],
@@ -573,14 +573,24 @@ class TestUnique:
         result = algos.unique(index)
 
         # dict.fromkeys preserves the order
-        unique_values = list(dict.fromkeys(index.values))
+        unique_values = list(dict.fromkeys(index._values))
         if isinstance(index, MultiIndex):
             expected = MultiIndex.from_tuples(unique_values, names=index.names)
         else:
             expected = Index(unique_values, dtype=index.dtype)
             if isinstance(index.dtype, DatetimeTZDtype):
                 expected = expected.normalize()
-        tm.assert_index_equal(result, expected, exact=True)
+        tm.assert_index_equal(result, expected, exact=True, check_freq=False)
+
+    def test_factorize_multiindex_empty(self):
+        # GH#57517
+        mi = MultiIndex.from_product(
+            [Index([], name="a", dtype=object), Index([], name="i", dtype="f4")]
+        )
+        codes, uniques = mi.factorize()
+        exp_codes = np.array([], dtype=np.intp)
+        tm.assert_numpy_array_equal(codes, exp_codes)
+        tm.assert_index_equal(uniques, mi[:0])
 
     def test_dtype_preservation(self, any_numpy_dtype):
         # GH 15442
@@ -873,6 +883,14 @@ class TestUnique:
         expected = pd.array([1, pd.NA, 2], dtype=any_numeric_ea_dtype)
         tm.assert_extension_array_equal(result, expected)
 
+    def test_unique_NumpyExtensionArray(self):
+        arr_complex = pd.array(
+            [1 + 1j, 2, 3]
+        )  # NumpyEADtype('complex128') => NumpyExtensionArray
+        result = pd.unique(arr_complex)
+        expected = pd.array([1 + 1j, 2 + 0j, 3 + 0j])
+        tm.assert_extension_array_equal(result, expected)
+
 
 def test_nunique_ints(index_or_series_or_array):
     # GH#36327
@@ -990,21 +1008,18 @@ class TestIsin:
         tm.assert_numpy_array_equal(result, expected)
 
     @pytest.mark.parametrize("dtype", ["m8[ns]", "M8[ns]", "M8[ns, UTC]"])
-    def test_isin_datetimelike_strings_deprecated(self, dtype):
+    def test_isin_datetimelike_strings_returns_false(self, dtype):
         # GH#53111
         dta = date_range("2013-01-01", periods=3)._values
         arr = Series(dta.view("i8")).array.view(dtype)
 
         vals = [str(x) for x in arr]
-        msg = "The behavior of 'isin' with dtype=.* is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            res = algos.isin(arr, vals)
-        assert res.all()
+        res = algos.isin(arr, vals)
+        assert not res.any()
 
         vals2 = np.array(vals, dtype=str)
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            res2 = algos.isin(arr, vals2)
-        assert res2.all()
+        res2 = algos.isin(arr, vals2)
+        assert not res2.any()
 
     def test_isin_dt64tz_with_nat(self):
         # the all-NaT values used to get inferred to tznaive, which was evaluated
@@ -1042,7 +1057,7 @@ class TestIsin:
         # nan is special, because from " a is b" doesn't follow "a == b"
         # at least, isin() should follow python's "np.nan in [nan] == True"
         # casting to -> np.float64 -> another float-object somewhere on
-        # the way could lead jeopardize this behavior
+        # the way could jeopardize this behavior
         comps = np.array([np.nan], dtype=object)  # could be casted to float64
         values = [np.nan]
         expected = np.array([True])
@@ -1192,6 +1207,68 @@ class TestIsin:
         expected = Series(False)
         tm.assert_series_equal(result, expected)
 
+    def test_isin_uint64_vs_float_no_precision_loss(self):
+        # GH#46485: a uint64 magnitude > 2**53 must not be down-cast to float64
+        # when checking membership against float targets.
+        value = 2**63 + 3
+        ser = Series([value], dtype=np.uint64)
+        result = ser.isin([float(value)])  # float(value) rounds to 2.0**63
+        expected = Series([False])
+        tm.assert_series_equal(result, expected)
+
+    def test_isin_float_vs_int64_no_precision_loss(self):
+        # GH#46485: the symmetric case -- a float caller against int64 targets
+        # whose magnitude exceeds 2**53 must not collide via a float64 cast.
+        ser = Series([2.0**53], dtype="float64")
+        result = ser.isin([2**53 + 1])
+        expected = Series([False])
+        tm.assert_series_equal(result, expected)
+
+    def test_isin_uint64_vs_complex_no_precision_loss(self):
+        # GH#46485: complex128 components are float64, so casting a uint64
+        # with magnitude > 2**53 to complex128 is just as lossy as float64.
+        ser = Series([2**63 + 3], dtype=np.uint64)
+        result = ser.isin([complex(2**63)])
+        expected = Series([False])
+        tm.assert_series_equal(result, expected)
+
+    def test_isin_complex_vs_int64_no_precision_loss(self):
+        # GH#46485: the symmetric case -- a complex caller against int64
+        # targets whose magnitude exceeds 2**53.
+        ser = Series([complex(2**53)], dtype="complex128")
+        result = ser.isin([2**53 + 1])
+        expected = Series([False])
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize("dtype", ["float32", "complex128"])
+    def test_isin_mixed_int_float_targets_no_precision_loss(self, dtype):
+        # GH#46485: a mixed int/float targets list is cast to float64 by
+        # _ensure_arraylike, rounding 2**53 + 1 before the exact-range check
+        # can see it; we must still object-cast and compare exactly.
+        ser = Series([2**53], dtype="int64").astype(dtype)
+        result = ser.isin([2**53 + 1, 1.5])
+        expected = Series([False])
+        tm.assert_series_equal(result, expected)
+
+    def test_isin_float_vs_small_int_keeps_numeric_path(self, monkeypatch):
+        # GH#46485: int targets that fit exactly in float64 (|x| <= 2**53) are
+        # safe to compare numerically, so they must not fall back to the slower
+        # object-dtype path. 2**53 is the inclusive boundary.
+        called = []
+        monkeypatch.setattr(
+            algos,
+            "construct_1d_object_array_from_listlike",
+            lambda values: called.append(values) or np.asarray(values, dtype=object),
+        )
+        ser = Series([1.0, 2.0, 2.0**53], dtype="float64")
+        result = ser.isin([2, 2**53])
+        tm.assert_series_equal(result, Series([False, True, True]))
+        assert called == []  # numeric path, no object cast
+
+        # ... while an out-of-range target still forces the object path.
+        ser.isin([2**53 + 1])
+        assert len(called) == 1
+
 
 class TestValueCounts:
     def test_value_counts(self):
@@ -1236,7 +1313,7 @@ class TestValueCounts:
             algos.value_counts_internal(np.array(["1", 1], dtype=object), bins=1)
 
     def test_value_counts_nat(self):
-        td = Series([np.timedelta64(10000), NaT], dtype="timedelta64[ns]")
+        td = Series([np.timedelta64(10000, "ns"), NaT], dtype="timedelta64[ns]")
         dt = to_datetime(["NaT", "2014-01-01"])
 
         for ser in [td, dt]:
@@ -1249,7 +1326,7 @@ class TestValueCounts:
         result_dt = algos.value_counts_internal(dt)
         tm.assert_series_equal(result_dt, exp_dt)
 
-        exp_td = Series({np.timedelta64(10000): 1}, name="count")
+        exp_td = Series([1], index=[np.timedelta64(10000, "ns")], name="count")
         result_td = algos.value_counts_internal(td)
         tm.assert_series_equal(result_td, exp_td)
 
@@ -1267,6 +1344,7 @@ class TestValueCounts:
             ],
             dtype=dtype,
         )
+
         res = ser.value_counts()
 
         exp_index = Index(
@@ -1430,6 +1508,19 @@ class TestValueCounts:
         )
         tm.assert_series_equal(result, expected)
 
+    def test_value_counts_stability(self):
+        # GH 63155
+        arr = np.random.default_rng(2).integers(0, 32, 64)
+        result = algos.value_counts_internal(arr, sort=True)
+
+        value_counts = Series(arr).value_counts(sort=False)
+        expected = value_counts.sort_values(ascending=False, kind="stable")
+        tm.assert_series_equal(result, expected)
+
+        unstable_sorted = value_counts.sort_values(ascending=False, kind="quicksort")
+        with pytest.raises(AssertionError):
+            tm.assert_series_equal(result, unstable_sorted)
+
 
 class TestDuplicated:
     def test_duplicated_with_nas(self):
@@ -1453,7 +1544,7 @@ class TestDuplicated:
 
         keys = np.empty(8, dtype=object)
         for i, t in enumerate(
-            zip([0, 0, np.nan, np.nan] * 2, [0, np.nan, 0, np.nan] * 2)
+            zip([0, 0, np.nan, np.nan] * 2, [0, np.nan, 0, np.nan] * 2, strict=True)
         ):
             keys[i] = t
 
@@ -1564,7 +1655,7 @@ class TestDuplicated:
             np.array([Timestamp(d) for d in dt]),
             np.array([Timestamp(d, tz="US/Eastern") for d in dt]),
             np.array([Period(d, freq="D") for d in dt]),
-            np.array([np.datetime64(d) for d in dt]),
+            np.array([np.datetime64(d, "ns") for d in dt]),
             np.array([Timedelta(d) for d in td]),
         ]
 
@@ -1640,7 +1731,10 @@ class TestDuplicated:
         expected = np.empty(len(uniques), dtype=object)
         expected[:] = uniques
 
-        msg = "unique requires a Series, Index, ExtensionArray, or np.ndarray, got list"
+        msg = (
+            r"unique requires a Series, Index, ExtensionArray, np.ndarray "
+            r"or NumpyExtensionArray got list"
+        )
         with pytest.raises(TypeError, match=msg):
             # GH#52986
             pd.unique(arr)
@@ -1659,7 +1753,11 @@ class TestDuplicated:
     )
     def test_unique_complex_numbers(self, array, expected):
         # GH 17927
-        msg = "unique requires a Series, Index, ExtensionArray, or np.ndarray, got list"
+        msg = (
+            r"unique requires a Series, Index, ExtensionArray, np.ndarray "
+            r"or NumpyExtensionArray got list"
+        )
+
         with pytest.raises(TypeError, match=msg):
             # GH#52986
             pd.unique(array)
@@ -1672,8 +1770,14 @@ class TestHashTable:
     @pytest.mark.parametrize(
         "htable, data",
         [
-            (ht.PyObjectHashTable, [f"foo_{i}" for i in range(1000)]),
-            (ht.StringHashTable, [f"foo_{i}" for i in range(1000)]),
+            (
+                ht.PyObjectHashTable,
+                np.array([f"foo_{i}" for i in range(1000)], dtype=object),
+            ),
+            (
+                ht.StringHashTable,
+                np.array([f"foo_{i}" for i in range(1000)], dtype=object),
+            ),
             (ht.Float64HashTable, np.arange(1000, dtype=np.float64)),
             (ht.Int64HashTable, np.arange(1000, dtype=np.int64)),
             (ht.UInt64HashTable, np.arange(1000, dtype=np.uint64)),
@@ -1681,7 +1785,7 @@ class TestHashTable:
     )
     def test_hashtable_unique(self, htable, data, writable):
         # output of maker has guaranteed unique elements
-        s = Series(data)
+        s = Series(data, dtype=data.dtype)
         if htable == ht.Float64HashTable:
             # add NaN for float column
             s.loc[500] = np.nan
@@ -1711,8 +1815,14 @@ class TestHashTable:
     @pytest.mark.parametrize(
         "htable, data",
         [
-            (ht.PyObjectHashTable, [f"foo_{i}" for i in range(1000)]),
-            (ht.StringHashTable, [f"foo_{i}" for i in range(1000)]),
+            (
+                ht.PyObjectHashTable,
+                np.array([f"foo_{i}" for i in range(1000)], dtype=object),
+            ),
+            (
+                ht.StringHashTable,
+                np.array([f"foo_{i}" for i in range(1000)], dtype=object),
+            ),
             (ht.Float64HashTable, np.arange(1000, dtype=np.float64)),
             (ht.Int64HashTable, np.arange(1000, dtype=np.int64)),
             (ht.UInt64HashTable, np.arange(1000, dtype=np.uint64)),
@@ -1720,7 +1830,7 @@ class TestHashTable:
     )
     def test_hashtable_factorize(self, htable, writable, data):
         # output of maker has guaranteed unique elements
-        s = Series(data)
+        s = Series(data, dtype=data.dtype)
         if htable == ht.Float64HashTable:
             # add NaN for float column
             s.loc[500] = np.nan
@@ -1784,9 +1894,21 @@ class TestRank:
         s = Series([1, 2**63], dtype=dtype)
         tm.assert_numpy_array_equal(algos.rank(s), exp)
 
+    @pytest.mark.parametrize("method", ["average", "min", "max"])
+    def test_rank_tiny_values(self, method):
+        # GH62036: regression test for ranking with tiny float values
+        exp = np.array([4.0, 1.0, 3.0, np.nan, 2.0], dtype=np.float64)
+        s = Series(
+            [5.4954145e29, -9.791984e-21, 9.3715776e-26, pd.NA, 1.8790257e-28],
+            dtype="Float64",
+        )
+        s = s.astype(object)
+        result = algos.rank(s, method=method)
+        tm.assert_numpy_array_equal(result, exp)
+
     def test_too_many_ndims(self):
         arr = np.array([[[1, 2, 3], [4, 5, 6], [7, 8, 9]]])
-        msg = "Array with ndim > 2 are not supported"
+        msg = "Array with ndim > 2 is not supported"
 
         with pytest.raises(TypeError, match=msg):
             algos.rank(arr)
@@ -1803,10 +1925,63 @@ class TestRank:
         assert result == 1
 
 
+class TestIsMonotonic:
+    @pytest.mark.parametrize(
+        "arr, expected",
+        [
+            ([1, 2, 3], (True, False, True)),
+            ([3, 2, 1], (False, True, True)),
+            ([1, 2, 2, 3], (True, False, False)),
+            ([3, 2, 2, 1], (False, True, False)),
+            ([5, 5, 5], (True, True, False)),
+            ([1, 3, 2], (False, False, False)),
+            ([7], (True, True, True)),
+            ([], (True, True, True)),
+        ],
+    )
+    def test_numeric(self, arr, expected, any_real_numpy_dtype):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        values = np.array(arr, dtype=any_real_numpy_dtype)
+        assert algos.is_monotonic(values) == expected
+
+    def test_float16(self):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        # float16 is not supported by libalgos.is_monotonic directly;
+        # _ensure_data converts it to float64
+        values = np.array([1, 2, 3], dtype="float16")
+        assert algos.is_monotonic(values) == (True, False, True)
+        assert algos.is_monotonic(values[::-1]) == (False, True, True)
+
+    def test_bool(self):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        assert algos.is_monotonic(np.array([False, True, True])) == (True, False, False)
+        assert algos.is_monotonic(np.array([True, False])) == (False, True, True)
+
+    def test_object(self):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        values = np.array(["a", "b", "c"], dtype=object)
+        assert algos.is_monotonic(values) == (True, False, True)
+
+    @pytest.mark.parametrize("dtype", ["datetime64[ns]", "timedelta64[ns]"])
+    def test_datetimelike(self, dtype):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        values = np.array([1, 2, 3], dtype="int64").view(dtype)
+        assert algos.is_monotonic(values) == (True, False, True)
+        assert algos.is_monotonic(values[::-1]) == (False, True, True)
+
+    def test_complex_raises(self):
+        # https://github.com/pandas-dev/pandas/pull/65803
+        # complex is not orderable
+        values = np.array([1 + 0j, 2 + 0j], dtype="complex128")
+        with pytest.raises(TypeError, match="No matching signature found"):
+            algos.is_monotonic(values)
+
+
 class TestMode:
     def test_no_mode(self):
         exp = Series([], dtype=np.float64, index=Index([], dtype=int))
-        tm.assert_numpy_array_equal(algos.mode(np.array([])), exp.values)
+        result, _ = algos.mode(np.array([]))
+        tm.assert_numpy_array_equal(result, exp.values)
 
     def test_mode_single(self, any_real_numpy_dtype):
         # GH 15714
@@ -1818,20 +1993,24 @@ class TestMode:
 
         ser = Series(data_single, dtype=any_real_numpy_dtype)
         exp = Series(exp_single, dtype=any_real_numpy_dtype)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
         ser = Series(data_multi, dtype=any_real_numpy_dtype)
         exp = Series(exp_multi, dtype=any_real_numpy_dtype)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     def test_mode_obj_int(self):
         exp = Series([1], dtype=int)
-        tm.assert_numpy_array_equal(algos.mode(exp.values), exp.values)
+        result, _ = algos.mode(exp.values)
+        tm.assert_numpy_array_equal(result, exp.values)
 
         exp = Series(["a", "b", "c"], dtype=object)
-        tm.assert_numpy_array_equal(algos.mode(exp.values), exp.values)
+        result, _ = algos.mode(exp.values)
+        tm.assert_numpy_array_equal(result, exp.values)
 
     def test_number_mode(self, any_real_numpy_dtype):
         exp_single = [1]
@@ -1842,12 +2021,14 @@ class TestMode:
 
         ser = Series(data_single, dtype=any_real_numpy_dtype)
         exp = Series(exp_single, dtype=any_real_numpy_dtype)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
         ser = Series(data_multi, dtype=any_real_numpy_dtype)
         exp = Series(exp_multi, dtype=any_real_numpy_dtype)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     def test_strobj_mode(self):
@@ -1856,17 +2037,22 @@ class TestMode:
 
         ser = Series(data, dtype="c")
         exp = Series(exp, dtype="c")
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     @pytest.mark.parametrize("dt", [str, object])
-    def test_strobj_multi_char(self, dt):
+    def test_strobj_multi_char(self, dt, using_infer_string):
         exp = ["bar"]
         data = ["foo"] * 2 + ["bar"] * 3
 
         ser = Series(data, dtype=dt)
         exp = Series(exp, dtype=dt)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        if using_infer_string and dt is str:
+            tm.assert_extension_array_equal(result, exp.values)
+        else:
+            tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     def test_datelike_mode(self):
@@ -1900,18 +2086,21 @@ class TestMode:
     def test_mixed_dtype(self):
         exp = Series(["foo"], dtype=object)
         ser = Series([1, "foo", "foo"])
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     def test_uint64_overflow(self):
         exp = Series([2**63], dtype=np.uint64)
         ser = Series([1, 2**63, 2**63], dtype=np.uint64)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
         exp = Series([1, 2**63], dtype=np.uint64)
         ser = Series([1, 2**63], dtype=np.uint64)
-        tm.assert_numpy_array_equal(algos.mode(ser.values), exp.values)
+        result, _ = algos.mode(ser.values)
+        tm.assert_numpy_array_equal(result, exp.values)
         tm.assert_series_equal(ser.mode(), exp)
 
     def test_categorical(self):
@@ -1933,15 +2122,18 @@ class TestMode:
     def test_index(self):
         idx = Index([1, 2, 3])
         exp = Series([1, 2, 3], dtype=np.int64)
-        tm.assert_numpy_array_equal(algos.mode(idx), exp.values)
+        result, _ = algos.mode(idx)
+        tm.assert_numpy_array_equal(result, exp.values)
 
         idx = Index([1, "a", "a"])
         exp = Series(["a"], dtype=object)
-        tm.assert_numpy_array_equal(algos.mode(idx), exp.values)
+        result, _ = algos.mode(idx)
+        tm.assert_numpy_array_equal(result, exp.values)
 
         idx = Index([1, 1, 2, 3, 3])
         exp = Series([1, 3], dtype=np.int64)
-        tm.assert_numpy_array_equal(algos.mode(idx), exp.values)
+        result, _ = algos.mode(idx)
+        tm.assert_numpy_array_equal(result, exp.values)
 
         idx = Index(
             ["1 day", "1 day", "-1 day", "-1 day 2 min", "2 min", "2 min"],

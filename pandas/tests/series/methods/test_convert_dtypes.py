@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from pandas._libs import lib
+from pandas.errors import Pandas4Warning
+import pandas.util._test_decorators as td
 
 import pandas as pd
 import pandas._testing as tm
@@ -172,7 +174,7 @@ class TestSeriesConvertDtypes:
             ),
         ],
     )
-    @pytest.mark.parametrize("params", product(*[(True, False)] * 5))
+    @pytest.mark.parametrize("params", list(product(*[(True, False)] * 5)))
     def test_convert_dtypes(
         self,
         data,
@@ -181,6 +183,7 @@ class TestSeriesConvertDtypes:
         expected_other,
         params,
         using_infer_string,
+        using_nan_is_na,
     ):
         if (
             hasattr(data, "dtype")
@@ -198,7 +201,8 @@ class TestSeriesConvertDtypes:
         else:
             series = pd.Series(data)
 
-        result = series.convert_dtypes(*params)
+        with tm.assert_produces_warning(Pandas4Warning):
+            result = series.convert_dtypes(*params)
 
         param_names = [
             "infer_objects",
@@ -207,11 +211,14 @@ class TestSeriesConvertDtypes:
             "convert_boolean",
             "convert_floating",
         ]
-        params_dict = dict(zip(param_names, params))
+        params_dict = dict(zip(param_names, params, strict=True))
 
         expected_dtype = expected_default
         for spec, dtype in expected_other.items():
-            if all(params_dict[key] is val for key, val in zip(spec[::2], spec[1::2])):
+            if all(
+                params_dict[key] is val
+                for key, val in zip(spec[::2], spec[1::2], strict=False)
+            ):
                 expected_dtype = dtype
         if (
             using_infer_string
@@ -220,9 +227,19 @@ class TestSeriesConvertDtypes:
             and params[0]
             and not params[1]
         ):
-            # If we would convert with convert strings then infer_objects converts
-            # with the option
-            expected_dtype = "string[pyarrow_numpy]"
+            # If convert_string=False and infer_objects=True, we end up with the
+            # default string dtype instead of preserving object for string data
+            expected_dtype = pd.StringDtype(na_value=np.nan)
+        if (
+            not using_nan_is_na
+            and expected_dtype == "Int64"
+            and isinstance(data[1], float)
+            and np.isnan(data[1])
+        ):
+            if params_dict["convert_floating"]:
+                expected_dtype = "Float64"
+            else:
+                expected_dtype = "float64"
 
         expected = pd.Series(data, dtype=expected_dtype)
         tm.assert_series_equal(result, expected)
@@ -231,10 +248,10 @@ class TestSeriesConvertDtypes:
         copy = series.copy(deep=True)
 
         if result.notna().sum() > 0 and result.dtype in ["interval[int64, right]"]:
-            with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+            with pytest.raises(TypeError, match="Invalid value"):
                 result[result.notna()] = np.nan
         else:
-            result[result.notna()] = np.nan
+            result[result.notna()] = pd.NA
 
         # Make sure original not changed
         tm.assert_series_equal(series, copy)
@@ -268,7 +285,8 @@ class TestSeriesConvertDtypes:
     def test_convert_dtype_object_with_na(self, infer_objects, dtype):
         # GH#48791
         ser = pd.Series([1, pd.NA])
-        result = ser.convert_dtypes(infer_objects=infer_objects)
+        with tm.assert_produces_warning(Pandas4Warning):
+            result = ser.convert_dtypes(infer_objects=infer_objects)
         expected = pd.Series([1, pd.NA], dtype=dtype)
         tm.assert_series_equal(result, expected)
 
@@ -278,7 +296,8 @@ class TestSeriesConvertDtypes:
     def test_convert_dtype_object_with_na_float(self, infer_objects, dtype):
         # GH#48791
         ser = pd.Series([1.5, pd.NA])
-        result = ser.convert_dtypes(infer_objects=infer_objects)
+        with tm.assert_produces_warning(Pandas4Warning):
+            result = ser.convert_dtypes(infer_objects=infer_objects)
         expected = pd.Series([1.5, pd.NA], dtype=dtype)
         tm.assert_series_equal(result, expected)
 
@@ -297,3 +316,29 @@ class TestSeriesConvertDtypes:
         result = ser.convert_dtypes(dtype_backend="pyarrow")
         expected = pd.Series([None, None], dtype=pd.ArrowDtype(pa.null()))
         tm.assert_series_equal(result, expected)
+
+    @td.skip_if_no("pyarrow")
+    @pytest.mark.parametrize("categories", [None, ["S1", "S2"]])
+    def test_convert_empty_categorical_to_pyarrow(self, categories):
+        # GH#59934
+        ser = pd.Series(pd.Categorical([None] * 5, categories=categories))
+        converted = ser.convert_dtypes(dtype_backend="pyarrow")
+        expected = ser
+        tm.assert_series_equal(converted, expected)
+
+    def test_convert_dtype_pyarrow_timezone_preserve(self):
+        # GH 60237
+        pytest.importorskip("pyarrow")
+        ser = pd.Series(
+            pd.to_datetime(range(5), utc=True, unit="h"),
+            dtype="timestamp[ns, tz=UTC][pyarrow]",
+        )
+        result = ser.convert_dtypes(dtype_backend="pyarrow")
+        expected = ser.copy()
+        tm.assert_series_equal(result, expected)
+
+    def test_convert_dtypes_complex(self):
+        # GH 60129
+        ser = pd.Series([1.5 + 3.0j, 1.5 - 3.0j])
+        result = ser.convert_dtypes()
+        tm.assert_series_equal(result, ser)

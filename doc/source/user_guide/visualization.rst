@@ -326,8 +326,6 @@ The ``by`` keyword can be specified to plot grouped histograms:
 
 In addition, the ``by`` keyword can also be specified in :meth:`DataFrame.plot.hist`.
 
-.. versionchanged:: 1.4.0
-
 .. ipython:: python
 
    data = pd.DataFrame(
@@ -479,8 +477,6 @@ columns:
     plt.close("all")
 
 You could also create groupings with :meth:`DataFrame.plot.box`, for instance:
-
-.. versionchanged:: 1.4.0
 
 .. ipython:: python
    :suppress:
@@ -648,8 +644,6 @@ each point:
    plt.close("all")
 
 If a categorical column is passed to ``c``, then a discrete colorbar will be produced:
-
-.. versionadded:: 1.3.0
 
 .. ipython:: python
 
@@ -1211,11 +1205,6 @@ for x and y axis. By default, pandas will pick up index name as xlabel, while le
 it empty for ylabel.
 
 .. ipython:: python
-   :suppress:
-
-   plt.figure();
-
-.. ipython:: python
 
    df.plot();
 
@@ -1321,6 +1310,8 @@ plots, including those made by matplotlib, set the option
 ``pd.options.plotting.matplotlib.register_converters = True`` or use
 :meth:`pandas.plotting.register_matplotlib_converters`.
 
+.. _plotting.x_compat:
+
 Suppressing tick resolution adjustment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1382,8 +1373,7 @@ Automatic date tick adjustment
 tick locator methods, it is useful to call the automatic
 date tick adjustment from matplotlib for figures whose ticklabels overlap.
 
-See the :meth:`autofmt_xdate <matplotlib.figure.autofmt_xdate>` method and the
-`matplotlib documentation <https://matplotlib.org/2.0.2/users/recipes.html#fixing-common-date-annoyances>`__ for more.
+See the :meth:`autofmt_xdate <matplotlib.figure.autofmt_xdate>` method.
 
 Subplots
 ~~~~~~~~
@@ -1504,7 +1494,7 @@ Plotting with error bars
 
 Plotting with error bars is supported in :meth:`DataFrame.plot` and :meth:`Series.plot`.
 
-Horizontal and vertical error bars can be supplied to the ``xerr`` and ``yerr`` keyword arguments to :meth:`~DataFrame.plot()`. The error values can be specified using a variety of formats:
+Horizontal and vertical error bars can be supplied to the ``xerr`` and ``yerr`` keyword arguments to :meth:`~DataFrame.plot`. The error values can be specified using a variety of formats:
 
 * As a :class:`DataFrame` or ``dict`` of errors with column names matching the ``columns`` attribute of the plotting :class:`DataFrame` or matching the ``name`` attribute of the :class:`Series`.
 * As a ``str`` indicating which of the columns of plotting :class:`DataFrame` contain the error values.
@@ -1806,8 +1796,8 @@ This would be more or less equivalent to:
     >>> backend.module.plot(pd.Series([1, 2, 3]))
 
 The backend module can then use other visualization tools (Bokeh, Altair, hvplot,...)
-to generate the plots. Some libraries implementing a backend for pandas are listed
-on `the ecosystem page <https://pandas.pydata.org/community/ecosystem.html>`_.
+to generate the plots. Some libraries implementing a backend for pandas are
+listed on `the ecosystem page <https://pandas.pydata.org/community/ecosystem.html#plotting-backends>`_.
 
 Developers guide can be found at
 https://pandas.pydata.org/docs/dev/development/extending.html#plotting-backends

@@ -296,7 +296,9 @@ a,b,c,d
         ),
     ],
 )
-def test_na_values_keep_default(all_parsers, kwargs, expected, request):
+def test_na_values_keep_default(
+    all_parsers, kwargs, expected, request, using_infer_string
+):
     data = """\
 A,B,C
 a,1,one
@@ -314,8 +316,9 @@ g,7,seven
             with pytest.raises(ValueError, match=msg):
                 parser.read_csv(StringIO(data), **kwargs)
             return
-        mark = pytest.mark.xfail()
-        request.applymarker(mark)
+        if not using_infer_string or "na_values" in kwargs:
+            mark = pytest.mark.xfail()
+            request.applymarker(mark)
 
     result = parser.read_csv(StringIO(data), **kwargs)
     expected = DataFrame(expected)
@@ -426,7 +429,6 @@ def test_no_keep_default_na_dict_na_values_diff_reprs(all_parsers, col_zero_na_v
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # mismatched dtypes in both cases, FutureWarning in the True case
 @pytest.mark.parametrize(
     "na_filter,row_data",
     [
@@ -434,14 +436,27 @@ def test_no_keep_default_na_dict_na_values_diff_reprs(all_parsers, col_zero_na_v
         (False, [["1", "A"], ["nan", "B"], ["3", "C"]]),
     ],
 )
-def test_na_values_na_filter_override(all_parsers, na_filter, row_data):
+def test_na_values_na_filter_override(
+    request, all_parsers, na_filter, row_data, using_infer_string
+):
+    parser = all_parsers
     data = """\
 A,B
 1,A
 nan,B
 3,C
 """
-    parser = all_parsers
+    if parser.engine == "pyarrow":
+        if na_filter is False:
+            msg = "The 'na_filter' option is not supported with the 'pyarrow' engine"
+            with pytest.raises(ValueError, match=msg):
+                parser.read_csv(StringIO(data), na_values=["B"], na_filter=na_filter)
+            return
+        if not using_infer_string:
+            # mismatched dtypes, FutureWarning
+            mark = pytest.mark.xfail(reason="pyarrow doesn't support this.")
+            request.applymarker(mark)
+
     result = parser.read_csv(StringIO(data), na_values=["B"], na_filter=na_filter)
 
     expected = DataFrame(row_data, columns=["A", "B"])
@@ -490,13 +505,8 @@ def test_na_values_scalar(all_parsers, na_values, row_data):
     data = "1,2\n2,1"
 
     if parser.engine == "pyarrow" and isinstance(na_values, dict):
-        if isinstance(na_values, dict):
-            err = ValueError
-            msg = "The pyarrow engine doesn't support passing a dict for na_values"
-        else:
-            err = TypeError
-            msg = "The 'pyarrow' engine requires all na_values to be strings"
-        with pytest.raises(err, match=msg):
+        msg = "The pyarrow engine doesn't support passing a dict for na_values"
+        with pytest.raises(ValueError, match=msg):
             parser.read_csv(StringIO(data), names=names, na_values=na_values)
         return
     elif parser.engine == "pyarrow":
@@ -537,7 +547,7 @@ def test_na_values_dict_null_column_name(all_parsers):
     parser = all_parsers
     data = ",x,y\n\nMA,1,2\nNA,2,1\nOA,,3"
     names = [None, "x", "y"]
-    na_values = {name: STR_NA_VALUES for name in names}
+    na_values = dict.fromkeys(names, STR_NA_VALUES)
     dtype = {None: "object", "x": "float64", "y": "float64"}
 
     if parser.engine == "pyarrow":
@@ -555,10 +565,9 @@ def test_na_values_dict_null_column_name(all_parsers):
         return
 
     expected = DataFrame(
-        {None: ["MA", "NA", "OA"], "x": [1.0, 2.0, np.nan], "y": [2.0, 1.0, 3.0]}
+        {"x": [1.0, 2.0, np.nan], "y": [2.0, 1.0, 3.0]},
+        index=Index(["MA", "NA", "OA"], dtype=object),
     )
-
-    expected = expected.set_index(None)
 
     result = parser.read_csv(
         StringIO(data),
@@ -633,7 +642,7 @@ def test_empty_na_values_no_default_with_index(all_parsers):
 @pytest.mark.parametrize(
     "na_filter,index_data", [(False, ["", "5"]), (True, [np.nan, 5.0])]
 )
-def test_no_na_filter_on_index(all_parsers, na_filter, index_data, request):
+def test_no_na_filter_on_index(all_parsers, na_filter, index_data):
     # see gh-5239
     #
     # Don't parse NA-values in index unless na_filter=True
@@ -641,8 +650,10 @@ def test_no_na_filter_on_index(all_parsers, na_filter, index_data, request):
     data = "a,b,c\n1,,3\n4,5,6"
 
     if parser.engine == "pyarrow" and na_filter is False:
-        mark = pytest.mark.xfail(reason="mismatched index result")
-        request.applymarker(mark)
+        msg = "The 'na_filter' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(StringIO(data), index_col=[1], na_filter=na_filter)
+        return
 
     expected = DataFrame({"a": [1, 4], "c": [3, 6]}, index=Index(index_data, name="b"))
     result = parser.read_csv(StringIO(data), index_col=[1], na_filter=na_filter)
@@ -662,12 +673,23 @@ def test_inf_na_values_with_int_index(all_parsers):
     tm.assert_frame_equal(out, expected)
 
 
-@xfail_pyarrow  # mismatched shape
 @pytest.mark.parametrize("na_filter", [True, False])
-def test_na_values_with_dtype_str_and_na_filter(all_parsers, na_filter):
+def test_na_values_with_dtype_str_and_na_filter(
+    all_parsers, na_filter, using_infer_string, request
+):
     # see gh-20377
     parser = all_parsers
     data = "a,b,c\n1,,3\n4,5,6"
+
+    if parser.engine == "pyarrow":
+        if na_filter is False:
+            msg = "The 'na_filter' option is not supported with the 'pyarrow' engine"
+            with pytest.raises(ValueError, match=msg):
+                parser.read_csv(StringIO(data), na_filter=na_filter, dtype=str)
+            return
+        if not using_infer_string:
+            mark = pytest.mark.xfail(reason="mismatched shape")
+            request.applymarker(mark)
 
     # na_filter=True --> missing value becomes NaN.
     # na_filter=False --> missing value remains empty string.
@@ -790,7 +812,18 @@ NaN
 True
 False
 """
-    with pytest.raises(ValueError, match="convert|NoneType"):
+    msg = (
+        "cannot safely convert passed user dtype of int(64|32) for "
+        "<class 'numpy.bool_?'> dtyped data in column 0 due to NA values"
+    )
+    if parser.engine == "python":
+        msg = "Unable to convert column 0 to type int(64|32)"
+    elif parser.engine == "pyarrow":
+        msg = (
+            r"int\(\) argument must be a string, a bytes-like object or a "
+            "real number, not 'NoneType"
+        )
+    with pytest.raises(ValueError, match=msg):
         parser.read_csv(StringIO(data), dtype="int")
 
 
@@ -804,4 +837,27 @@ False
 """
     result = parser.read_csv(StringIO(data), dtype="float")
     expected = DataFrame.from_dict({"0": [np.nan, 1.0, 0.0]})
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "na_values",
+    [[-99.0, -99], [-99, -99.0]],
+)
+def test_na_values_dict_without_dtype(all_parsers, na_values):
+    parser = all_parsers
+    data = """A
+-99
+-99
+-99.0
+-99.0"""
+
+    if parser.engine == "pyarrow":
+        msg = "The 'pyarrow' engine requires all na_values to be strings"
+        with pytest.raises(TypeError, match=msg):
+            parser.read_csv(StringIO(data), na_values=na_values)
+        return
+
+    result = parser.read_csv(StringIO(data), na_values=na_values)
+    expected = DataFrame({"A": [np.nan, np.nan, np.nan, np.nan]})
     tm.assert_frame_equal(result, expected)

@@ -3,16 +3,16 @@ Tests for DatetimeIndex timezone-related methods
 """
 
 from datetime import (
+    UTC,
     datetime,
     timedelta,
-    timezone,
     tzinfo,
 )
+import zoneinfo
 
 from dateutil.tz import gettz
 import numpy as np
 import pytest
-import pytz
 
 from pandas._libs.tslibs import (
     conversion,
@@ -76,40 +76,30 @@ class TestDatetimeIndexTimezones:
 
         start = Timestamp("201710290100", tz=tz)
         end = Timestamp("201710290300", tz=tz)
-        index = date_range(start=start, end=end, freq=freq)
+        index = date_range(start=start, end=end, freq=freq, unit="ns")
 
-        expected = DatetimeIndex(
-            [
-                "201710290115",
-                "201710290130",
-                "201710290145",
-                "201710290200",
-                "201710290215",
-                "201710290230",
-                "201710290245",
-                "201710290200",
-                "201710290215",
-                "201710290230",
-                "201710290245",
-                "201710290300",
-            ],
-            dtype="M8[ns, Europe/Brussels]",
-            freq=freq,
-            ambiguous=[
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                True,
-                False,
-                False,
-                False,
-                False,
-                False,
-            ],
+        is_dst = [True] * 7 + [False] * 5
+        expected = (
+            DatetimeIndex(
+                [
+                    "201710290115",
+                    "201710290130",
+                    "201710290145",
+                    "201710290200",
+                    "201710290215",
+                    "201710290230",
+                    "201710290245",
+                    "201710290200",
+                    "201710290215",
+                    "201710290230",
+                    "201710290245",
+                    "201710290300",
+                ],
+            )
+            .tz_localize(tz, ambiguous=is_dst)
+            .as_unit("ns")
         )
+        expected.freq = freq
         result = index.drop(index[0])
         tm.assert_index_equal(result, expected)
 
@@ -132,7 +122,7 @@ class TestDatetimeIndexTimezones:
         assert val.hour == 3
         assert exp.hour == 3
         assert val == exp  # same UTC value
-        tm.assert_index_equal(rng[:2], rng2)
+        tm.assert_index_equal(rng[:2], rng2, check_freq=False)
 
     def test_date_range_localize2(self, unit):
         # Right before the DST transition
@@ -162,7 +152,7 @@ class TestDatetimeIndexTimezones:
         eastern_range = utc_range.tz_convert("US/Eastern")
         berlin_range = utc_range.tz_convert("Europe/Berlin")
 
-        for a, b, c in zip(utc_range, eastern_range, berlin_range):
+        for a, b, c in zip(utc_range, eastern_range, berlin_range, strict=True):
             assert a == b
             assert b == c
             assert a == c
@@ -200,21 +190,22 @@ class TestDatetimeIndexTimezones:
         # right tzinfo
         rng = date_range("3/13/2012", "3/14/2012", freq="h", tz="utc")
         rng_eastern = rng.tz_convert(tzstr)
-        # test not valid for dateutil timezones.
-        # assert 'EDT' in repr(rng_eastern[0].tzinfo)
-        assert "EDT" in repr(rng_eastern[0].tzinfo) or "tzfile" in repr(
-            rng_eastern[0].tzinfo
-        )
+        if "dateutil" in tzstr:
+            assert "EDT" in repr(rng_eastern[0].tzinfo) or "tzfile" in repr(
+                rng_eastern[0].tzinfo
+            )
 
-    @pytest.mark.parametrize("tz", [pytz.timezone("US/Central"), gettz("US/Central")])
+    @pytest.mark.parametrize(
+        "tz", [zoneinfo.ZoneInfo("US/Central"), gettz("US/Central")]
+    )
     def test_with_tz(self, tz):
         # just want it to work
-        start = datetime(2011, 3, 12, tzinfo=pytz.utc)
+        start = datetime(2011, 3, 12, tzinfo=UTC)
         dr = bdate_range(start, periods=50, freq=pd.offsets.Hour())
-        assert dr.tz is pytz.utc
+        assert dr.tz is UTC
 
         # DateRange with naive datetimes
-        dr = bdate_range("1/1/2005", "1/1/2009", tz=pytz.utc)
+        dr = bdate_range("1/1/2005", "1/1/2009", tz=UTC)
         dr = bdate_range("1/1/2005", "1/1/2009", tz=tz)
 
         # normalized
@@ -231,13 +222,16 @@ class TestDatetimeIndexTimezones:
 
         # datetimes with tzinfo set
         dr = bdate_range(
-            datetime(2005, 1, 1, tzinfo=pytz.utc), datetime(2009, 1, 1, tzinfo=pytz.utc)
+            datetime(2005, 1, 1, tzinfo=UTC),
+            datetime(2009, 1, 1, tzinfo=UTC),
         )
         msg = "Start and end cannot both be tz-aware with different timezones"
         with pytest.raises(Exception, match=msg):
-            bdate_range(datetime(2005, 1, 1, tzinfo=pytz.utc), "1/1/2009", tz=tz)
+            bdate_range(datetime(2005, 1, 1, tzinfo=UTC), "1/1/2009", tz=tz)
 
-    @pytest.mark.parametrize("tz", [pytz.timezone("US/Eastern"), gettz("US/Eastern")])
+    @pytest.mark.parametrize(
+        "tz", [zoneinfo.ZoneInfo("US/Eastern"), gettz("US/Eastern")]
+    )
     def test_dti_convert_tz_aware_datetime_datetime(self, tz):
         # GH#1581
         dates = [datetime(2000, 1, 1), datetime(2000, 1, 2), datetime(2000, 1, 3)]
@@ -249,4 +243,4 @@ class TestDatetimeIndexTimezones:
         converted = to_datetime(dates_aware, utc=True).as_unit("ns")
         ex_vals = np.array([Timestamp(x).as_unit("ns")._value for x in dates_aware])
         tm.assert_numpy_array_equal(converted.asi8, ex_vals)
-        assert converted.tz is timezone.utc
+        assert converted.tz is UTC

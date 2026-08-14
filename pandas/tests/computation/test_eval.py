@@ -7,7 +7,11 @@ import operator
 import numpy as np
 import pytest
 
-from pandas.compat import PY312
+from pandas.compat import (
+    PY312,
+    PY314,
+)
+from pandas.compat._optional import import_optional_dependency
 from pandas.errors import (
     NumExprClobberingError,
     PerformanceWarning,
@@ -53,6 +57,9 @@ from pandas.core.computation.ops import (
     _unary_math_ops,
 )
 from pandas.core.computation.scope import DEFAULT_GLOBALS
+from pandas.util.version import Version
+
+numexpr = import_optional_dependency("numexpr", errors="ignore")
 
 
 @pytest.fixture(
@@ -100,17 +107,21 @@ def _eval_single_bin(lhs, cmp1, rhs, engine):
     ids=["DataFrame", "Series", "SeriesNaN", "DataFrameNaN", "float"],
 )
 def lhs(request):
-    nan_df1 = DataFrame(np.random.default_rng(2).standard_normal((10, 5)))
-    nan_df1[nan_df1 > 0.5] = np.nan
-
-    opts = (
-        DataFrame(np.random.default_rng(2).standard_normal((10, 5))),
-        Series(np.random.default_rng(2).standard_normal(5)),
-        Series([1, 2, np.nan, np.nan, 5]),
-        nan_df1,
-        np.random.default_rng(2).standard_normal(),
-    )
-    return opts[request.param]
+    rng = np.random.default_rng(2)
+    if request.param == 0:
+        return DataFrame(rng.standard_normal((10, 5)))
+    elif request.param == 1:
+        return Series(rng.standard_normal(5))
+    elif request.param == 2:
+        return Series([1, 2, np.nan, np.nan, 5])
+    elif request.param == 3:
+        nan_df1 = DataFrame(rng.standard_normal((10, 5)))
+        nan_df1[nan_df1 > 0.5] = np.nan
+        return nan_df1
+    elif request.param == 4:
+        return rng.standard_normal()
+    else:
+        raise ValueError(f"{request.param}")
 
 
 rhs = lhs
@@ -171,7 +182,7 @@ class TestEval:
                 r"only list-like( or dict-like)? objects are allowed to be "
                 r"passed to (DataFrame\.)?isin\(\), you passed a "
                 r"(`|')bool(`|')",
-                "argument of type 'bool' is not iterable",
+                "argument of type 'bool' is not .*",
             ]
         )
         if cmp_op in ("in", "not in") and not is_list_like(rhs):
@@ -216,7 +227,7 @@ class TestEval:
                 r"only list-like( or dict-like)? objects are allowed to be "
                 r"passed to (DataFrame\.)?isin\(\), you passed a "
                 r"(`|')float(`|')",
-                "argument of type 'float' is not iterable",
+                "argument of type 'float' is not .*",
             ]
         )
         if is_scalar(rhs) and op in skip_these:
@@ -320,7 +331,9 @@ class TestEval:
     def test_floor_division(self, lhs, rhs, engine, parser):
         ex = "lhs // rhs"
 
-        if engine == "python":
+        if engine == "python" or (
+            engine == "numexpr" and Version(numexpr.__version__) >= Version("2.13.0")
+        ):
             res = pd.eval(ex, engine=engine, parser=parser)
             expected = lhs // rhs
             tm.assert_equal(res, expected)
@@ -391,7 +404,7 @@ class TestEval:
 
         # int raises on numexpr
         lhs = DataFrame(np.random.default_rng(2).integers(5, size=(5, 2)))
-        if engine == "numexpr":
+        if engine == "numexpr" and Version(numexpr.__version__) < Version("2.13.0"):
             msg = "couldn't find matching opcode for 'invert"
             with pytest.raises(NotImplementedError, match=msg):
                 pd.eval(expr, engine=engine, parser=parser)
@@ -436,7 +449,7 @@ class TestEval:
 
         # int raises on numexpr
         lhs = Series(np.random.default_rng(2).integers(5, size=5))
-        if engine == "numexpr":
+        if engine == "numexpr" and Version(numexpr.__version__) < Version("2.13.0"):
             msg = "couldn't find matching opcode for 'invert"
             with pytest.raises(NotImplementedError, match=msg):
                 pd.eval(expr, engine=engine, parser=parser)
@@ -558,7 +571,9 @@ class TestEval:
     def test_scalar_unary(self, engine, parser):
         msg = "bad operand type for unary ~: 'float'"
         warn = None
-        if PY312 and not (engine == "numexpr" and parser == "pandas"):
+        if (PY314 and engine == "numexpr" and parser == "pandas") or (
+            PY312 and not (engine == "numexpr" and parser == "pandas")
+        ):
             warn = DeprecationWarning
         with pytest.raises(TypeError, match=msg):
             pd.eval("~1.0", engine=engine, parser=parser)
@@ -643,7 +658,9 @@ class TestEval:
         x, a, b = np.random.default_rng(2).standard_normal(3), 1, 2  # noqa: F841
         df = DataFrame(np.random.default_rng(2).standard_normal((3, 2)))  # noqa: F841
 
-        msg = "cannot evaluate scalar only bool ops|'BoolOp' nodes are not"
+        msg = "|".join(
+            ["cannot evaluate scalar only bool ops", "'BoolOp' nodes are not"]
+        )
         with pytest.raises(NotImplementedError, match=msg):
             pd.eval(ex, engine=engine, parser=parser)
 
@@ -758,16 +775,25 @@ class TestTypeCasting:
     # maybe someday... numexpr has too many upcasting rules now
     # chain(*(np.core.sctypes[x] for x in ['uint', 'int', 'float']))
     @pytest.mark.parametrize("left_right", [("df", "3"), ("3", "df")])
-    def test_binop_typecasting(self, engine, parser, op, float_numpy_dtype, left_right):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((5, 3)), dtype=float_numpy_dtype
-        )
+    def test_binop_typecasting(
+        self, engine, parser, op, complex_or_float_dtype, left_right, request
+    ):
+        # GH#21374
+        dtype = complex_or_float_dtype
+        df = DataFrame(np.random.default_rng(2).standard_normal((5, 3)), dtype=dtype)
         left, right = left_right
         s = f"{left} {op} {right}"
         res = pd.eval(s, engine=engine, parser=parser)
-        assert df.values.dtype == float_numpy_dtype
-        assert res.values.dtype == float_numpy_dtype
-        tm.assert_frame_equal(res, eval(s))
+        if dtype == "complex64" and engine == "numexpr":
+            mark = pytest.mark.xfail(
+                reason="numexpr issue with complex that are upcast "
+                "to complex 128 "
+                "https://github.com/pydata/numexpr/issues/492"
+            )
+            request.applymarker(mark)
+        assert df.values.dtype == dtype
+        assert res.values.dtype == dtype
+        tm.assert_frame_equal(res, eval(s), check_exact=False)
 
 
 # -------------------------------------
@@ -784,7 +810,7 @@ def should_warn(*args):
 
 class TestAlignment:
     index_types = ["i", "s", "dt"]
-    lhs_index_types = index_types + ["s"]  # 'p'
+    lhs_index_types = [*index_types, "s"]  # 'p'
 
     def test_align_nested_unary_op(self, engine, parser):
         s = "df * ~2"
@@ -898,25 +924,12 @@ class TestAlignment:
     @pytest.mark.parametrize("index_name", ["index", "columns"])
     @pytest.mark.parametrize(
         "r_idx_type, c_idx_type",
-        list(product(["i", "s"], ["i", "s"])) + [("dt", "dt")],
+        [*list(product(["i", "s"], ["i", "s"])), ("dt", "dt")],
     )
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     def test_basic_series_frame_alignment(
-        self, request, engine, parser, index_name, r_idx_type, c_idx_type, idx_func_dict
+        self, engine, parser, index_name, r_idx_type, c_idx_type, idx_func_dict
     ):
-        if (
-            engine == "numexpr"
-            and parser in ("pandas", "python")
-            and index_name == "index"
-            and r_idx_type == "i"
-            and c_idx_type == "s"
-        ):
-            reason = (
-                f"Flaky column ordering when engine={engine}, "
-                f"parser={parser}, index_name={index_name}, "
-                f"r_idx_type={r_idx_type}, c_idx_type={c_idx_type}"
-            )
-            request.applymarker(pytest.mark.xfail(reason=reason, strict=False))
         df = DataFrame(
             np.random.default_rng(2).standard_normal((10, 7)),
             index=idx_func_dict[r_idx_type](10),
@@ -1091,7 +1104,7 @@ class TestOperations:
             ex3 = f"1 {op} (x + 1)"
 
             if op in ("in", "not in"):
-                msg = "argument of type 'int' is not iterable"
+                msg = "argument of type 'int' is not .*"
                 with pytest.raises(TypeError, match=msg):
                     pd.eval(ex, engine=engine, parser=parser)
             else:
@@ -1178,7 +1191,7 @@ class TestOperations:
         expec3 = df.a + df.b + df.c[df.b < 0]
         exprs = expr1, expr2, expr3
         expecs = expec1, expec2, expec3
-        for e, expec in zip(exprs, expecs):
+        for e, expec in zip(exprs, expecs, strict=True):
             tm.assert_series_equal(expec, self.eval(e, local_dict={"df": df}))
 
     def test_assignment_fails(self):
@@ -1287,7 +1300,6 @@ class TestOperations:
         expected = Series([True], name="a")
         tm.assert_series_equal(result, expected)
 
-    @pytest.mark.xfail(reason="Unknown: Omitted test_ in name prior.")
     def test_assignment_not_inplace(self):
         # see gh-9297
         df = DataFrame(
@@ -1299,7 +1311,8 @@ class TestOperations:
 
         expected = df.copy()
         expected["c"] = expected["a"] + expected["b"]
-        tm.assert_frame_equal(df, expected)
+        tm.assert_frame_equal(actual, expected)
+        assert list(df.columns) == ["a", "b"]
 
     def test_multi_line_expression(self):
         # GH 11149
@@ -1631,6 +1644,19 @@ class TestMath:
             expect = getattr(np, fn)(a)
         tm.assert_series_equal(got, expect)
 
+    def test_unary_function_integer_argument(self, engine, parser):
+        # GH#20890 a math function applied to an integer literal must not
+        #  truncate the result to an integer
+        result = self.eval("exp(2)", engine=engine, parser=parser)
+        assert result == np.exp(2)
+
+    def test_unary_function_integer_array(self, engine, parser):
+        # GH#20890 the same truncation bug affected a math function over an
+        #  integer array (the manifestation that lingered longest)
+        arr = np.array([1, 2, 3])  # noqa: F841
+        result = self.eval("exp(arr)", engine=engine, parser=parser)
+        tm.assert_numpy_array_equal(np.asarray(result), np.exp(np.array([1, 2, 3])))
+
     @pytest.mark.parametrize("fn", _binary_math_ops)
     def test_binary_functions(self, fn, engine, parser):
         df = DataFrame(
@@ -1791,7 +1817,7 @@ def test_numexpr_option_incompatible_op():
             {"A": [True, False, True, False, None, None], "B": [1, 2, 3, 4, 5, 6]}
         )
         result = df.query("A.isnull()")
-        expected = DataFrame({"A": [None, None], "B": [5, 6]}, index=[4, 5])
+        expected = DataFrame({"A": [None, None], "B": [5, 6]}, index=range(4, 6))
         tm.assert_frame_equal(result, expected)
 
 
@@ -1869,6 +1895,15 @@ def test_empty_string_raises(engine, parser):
         pd.eval("", engine=engine, parser=parser)
 
 
+@pytest.mark.parametrize("box", [Series, DataFrame])
+def test_pandas_object_raises(box, engine, parser):
+    # GH#16289 passing a Series/DataFrame parsed its (possibly truncated) repr
+    obj = box(["1 == 1", "2 == 1"] * 1000)
+    msg = "expr must be a string to be evaluated"
+    with pytest.raises(ValueError, match=msg):
+        pd.eval(obj, engine=engine, parser=parser)
+
+
 def test_more_than_one_expression_raises(engine, parser):
     with pytest.raises(SyntaxError, match="only a single expression is allowed"):
         pd.eval("1 + 1; 2 + 2", engine=engine, parser=parser)
@@ -1891,7 +1926,9 @@ def test_bool_ops_fails_on_scalars(lhs, cmp, rhs, engine, parser):
     ex2 = f"lhs {cmp} mid and mid {cmp} rhs"
     ex3 = f"(lhs {cmp} mid) & (mid {cmp} rhs)"
     for ex in (ex1, ex2, ex3):
-        msg = "cannot evaluate scalar only bool ops|'BoolOp' nodes are not"
+        msg = "|".join(
+            ["cannot evaluate scalar only bool ops", "'BoolOp' nodes are not"]
+        )
         with pytest.raises(NotImplementedError, match=msg):
             pd.eval(ex, engine=engine, parser=parser)
 
@@ -1949,13 +1986,13 @@ def test_negate_lt_eq_le(engine, parser):
     "column",
     DEFAULT_GLOBALS.keys(),
 )
-def test_eval_no_support_column_name(request, column):
-    # GH 44603
+def test_eval_no_support_column_name(request, engine, parser, column):
+    # GH#44603, GH#35695
     if column in ["True", "False", "inf", "Inf"]:
         request.applymarker(
             pytest.mark.xfail(
                 raises=KeyError,
-                reason=f"GH 47859 DataFrame eval not supported with {column}",
+                reason=f"GH#47859 DataFrame eval not supported with {column}",
             )
         )
 
@@ -1964,7 +2001,7 @@ def test_eval_no_support_column_name(request, column):
         columns=[column, "col1"],
     )
     expected = df[df[column] > 6]
-    result = df.query(f"{column}>6")
+    result = df.query(f"{column}>6", engine=engine, parser=parser)
 
     tm.assert_frame_equal(result, expected)
 
@@ -1989,3 +2026,32 @@ def test_validate_bool_args(value):
     msg = 'For argument "inplace" expected type bool, received type'
     with pytest.raises(ValueError, match=msg):
         pd.eval("2+2", inplace=value)
+
+
+@td.skip_if_no("numexpr")
+def test_eval_float_div_numexpr():
+    # GH 59736
+    result = pd.eval("1 / 2", engine="numexpr")
+    expected = 0.5
+    assert result == expected
+
+
+def test_method_calls_on_binop():
+    # GH 61175
+    x = Series([1, 2, 3, 5])
+    y = Series([2, 3, 4])
+
+    # Method call on binary operation result
+    result = pd.eval("(x + y).dropna()")
+    expected = (x + y).dropna()
+    tm.assert_series_equal(result, expected)
+
+    # Test with other binary operations
+    result = pd.eval("(x * y).dropna()")
+    expected = (x * y).dropna()
+    tm.assert_series_equal(result, expected)
+
+    # Test with method chaining
+    result = pd.eval("(x + y).dropna().reset_index(drop=True)")
+    expected = (x + y).dropna().reset_index(drop=True)
+    tm.assert_series_equal(result, expected)

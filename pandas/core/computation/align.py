@@ -8,15 +8,12 @@ from functools import (
     partial,
     wraps,
 )
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-)
+from typing import TYPE_CHECKING
 import warnings
 
 import numpy as np
 
-from pandas._config.config import get_option
+from pandas._config.config import _global_config as config
 
 from pandas.errors import PerformanceWarning
 from pandas.util._exceptions import find_stack_level
@@ -31,7 +28,10 @@ import pandas.core.common as com
 from pandas.core.computation.common import result_type_many
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import (
+        Callable,
+        Sequence,
+    )
 
     from pandas._typing import F
 
@@ -93,7 +93,7 @@ def _align_core(terms):
 
     from pandas import Series
 
-    ndims = Series(dict(zip(term_index, term_dims)))
+    ndims = Series(dict(zip(term_index, term_dims, strict=True)))
 
     # initial axes are the axes of the largest-axis'd term
     biggest = terms[ndims.idxmax()].value
@@ -116,7 +116,7 @@ def _align_core(terms):
                 axes[ax] = axes[ax].union(itm)
 
     for i, ndim in ndims.items():
-        for axis, items in zip(range(ndim), axes):
+        for axis, items in zip(range(ndim), axes, strict=False):
             ti = terms[i].value
 
             if hasattr(ti, "reindex"):
@@ -128,7 +128,7 @@ def _align_core(terms):
 
                 ordm = np.log10(max(1, abs(reindexer_size - term_axis_size)))
                 if (
-                    get_option("performance_warnings")
+                    config["mode"]["performance_warnings"]
                     and ordm >= 1
                     and reindexer_size >= 10000
                 ):
@@ -144,7 +144,7 @@ def _align_core(terms):
                 obj = ti.reindex(reindexer, axis=axis)
                 terms[i].update(obj)
 
-        terms[i].update(terms[i].value.values)
+        terms[i].update(terms[i].value._values)
 
     return typ, _zip_axes_from_type(typ, axes)
 
@@ -213,7 +213,7 @@ def reconstruct_object(typ, obj, axes, dtype, name):
     if hasattr(res_t, "type") and typ == np.bool_ and res_t != np.bool_:
         ret_value = res_t.type(obj)
     else:
-        ret_value = typ(obj).astype(res_t)
+        ret_value = res_t.type(obj)
         # The condition is to distinguish 0-dim array (returned in case of
         # scalar) and 1 element array
         # e.g. np.array(0) and np.array([0])

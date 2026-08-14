@@ -306,7 +306,7 @@ def test_assert_almost_equal_inf(a, b):
     _assert_almost_equal_both(a, b)
 
 
-objs = [NA, np.nan, NaT, None, np.datetime64("NaT"), np.timedelta64("NaT")]
+objs = [NA, np.nan, NaT, None, np.datetime64("NaT", "ns"), np.timedelta64("NaT", "ns")]
 
 
 @pytest.mark.parametrize("left", objs)
@@ -533,6 +533,10 @@ NESTED_CASES = [
     (
         np.array([np.array([1, 2, 3]), np.array([4, 5])], dtype=object),
         np.array([[1, 2, 3], [4, 5]], dtype=object),
+    ),
+    (
+        np.array([np.array([], dtype=object), None], dtype=object),
+        np.array([[], None], dtype=object),
     ),
     (
         np.array(

@@ -5,10 +5,7 @@ Utilities for interpreting CSS from Stylers for formatting non-HTML outputs.
 from __future__ import annotations
 
 import re
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-)
+from typing import TYPE_CHECKING
 import warnings
 
 from pandas.errors import CSSWarning
@@ -16,6 +13,7 @@ from pandas.util._exceptions import find_stack_level
 
 if TYPE_CHECKING:
     from collections.abc import (
+        Callable,
         Generator,
         Iterable,
         Iterator,
@@ -36,9 +34,7 @@ def _side_expander(prop_fmt: str) -> Callable:
         function: Return to call when a 'border(-{side}): {value}' string is encountered
     """
 
-    def expand(
-        self: CSSResolver, prop: str, value: str
-    ) -> Generator[tuple[str, str], None, None]:
+    def expand(self: CSSResolver, prop: str, value: str) -> Generator[tuple[str, str]]:
         """
         Expand shorthand property into side-specific property (top, right, bottom, left)
 
@@ -61,7 +57,7 @@ def _side_expander(prop_fmt: str) -> Callable:
                 stacklevel=find_stack_level(),
             )
             return
-        for key, idx in zip(self.SIDES, mapping):
+        for key, idx in zip(self.SIDES, mapping, strict=True):
             yield prop_fmt.format(key), tokens[idx]
 
     return expand
@@ -83,9 +79,7 @@ def _border_expander(side: str = "") -> Callable:
     if side != "":
         side = f"-{side}"
 
-    def expand(
-        self: CSSResolver, prop: str, value: str
-    ) -> Generator[tuple[str, str], None, None]:
+    def expand(self: CSSResolver, prop: str, value: str) -> Generator[tuple[str, str]]:
         """
         Expand border into color, style, and width tuples
 
@@ -127,6 +121,36 @@ def _border_expander(side: str = "") -> Callable:
         yield from self.atomize(border_declarations.items())
 
     return expand
+
+
+def _lowercase_css_values(value: str) -> str:
+    """
+    Preserves the case for all characters within single or double-quoted strings,
+    but lowercases everything else.
+
+    Intended to lowercase CSS properties and preserve string literals
+    (e.g. in Excel number formats).
+    Parameters
+    ----------
+    value: str
+        The CSS value string to process.
+
+    Returns
+    -------
+    str
+        The processed lowercase value with preserved case for quoted strings.
+
+    """
+    split = re.split(r'(".*?"|\'.*?\')', value)  # split by double and single quotes
+    res = []
+    for s in split:
+        if (s.startswith("'") and s.endswith("'")) or (
+            s.startswith('"') and s.endswith('"')
+        ):
+            res.append(s)
+        else:
+            res.append(s.lower())
+    return "".join(res)
 
 
 class CSSResolver:
@@ -394,10 +418,10 @@ class CSSResolver:
             size_fmt = f"{val:f}pt"
         return size_fmt
 
-    def atomize(self, declarations: Iterable) -> Generator[tuple[str, str], None, None]:
+    def atomize(self, declarations: Iterable) -> Generator[tuple[str, str]]:
         for prop, value in declarations:
             prop = prop.lower()
-            value = value.lower()
+            value = _lowercase_css_values(value)
             if prop in self.CSS_EXPANSIONS:
                 expand = self.CSS_EXPANSIONS[prop]
                 yield from expand(self, prop, value)
@@ -419,8 +443,7 @@ class CSSResolver:
                 continue
             prop, sep, val = decl.partition(":")
             prop = prop.strip().lower()
-            # TODO: don't lowercase case sensitive parts of values (strings)
-            val = val.strip().lower()
+            val = _lowercase_css_values(val.strip())
             if sep:
                 yield prop, val
             else:

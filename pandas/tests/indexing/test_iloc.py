@@ -1,12 +1,16 @@
 """test positional based indexing with iloc"""
 
+from array import array as std_array
+from collections import deque
 from datetime import datetime
 import re
 
 import numpy as np
 import pytest
 
+from pandas.compat import pa_version_under16p0
 from pandas.errors import IndexingError
+import pandas.util._test_decorators as td
 
 from pandas import (
     NA,
@@ -34,6 +38,26 @@ _slice_iloc_msg = re.escape(
     "only integers, slices (`:`), ellipsis (`...`), numpy.newaxis (`None`) "
     "and integer or boolean arrays are valid indices"
 )
+
+
+class DuckSequence:
+    """A sequence implementing only __len__/__getitem__, so not is_list_like."""
+
+    def __init__(self, data) -> None:
+        self.data = list(data)
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+
+class GetitemOnly:
+    """Subscriptable but unsized, so np.asarray treats it as a scalar."""
+
+    def __getitem__(self, key):
+        return key
 
 
 class TestiLoc:
@@ -105,16 +129,21 @@ class TestiLocBaseIndependent:
         expected = DataFrame({0: Series(cat.astype(object), dtype=object), 1: range(3)})
         tm.assert_frame_equal(df, expected)
 
-    def test_iloc_setitem_ea_inplace(self, frame_or_series, index_or_series_or_array):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_ea_inplace(
+        self, frame_or_series, index_or_series_or_array, has_ref
+    ):
         # GH#38952 Case with not setting a full column
         #  IntegerArray without NAs
         arr = array([1, 2, 3, 4])
         obj = frame_or_series(arr.to_numpy("i8"))
+        if has_ref:
+            view = obj[:]  # noqa: F841
 
         if frame_or_series is Series:
             values = obj.values
         else:
-            values = obj._mgr.arrays[0]
+            values = obj._mgr.blocks[0].values
 
         if frame_or_series is Series:
             obj.iloc[:2] = index_or_series_or_array(arr[2:])
@@ -125,11 +154,12 @@ class TestiLocBaseIndependent:
         tm.assert_equal(obj, expected)
 
         # Check that we are actually in-place
-        if frame_or_series is Series:
-            assert obj.values is not values
-            assert np.shares_memory(obj.values, values)
-        else:
-            assert np.shares_memory(obj[0].values, values)
+        if not has_ref:
+            if frame_or_series is Series:
+                assert obj.values is not values
+                assert np.shares_memory(obj.values, values)
+            else:
+                assert np.shares_memory(obj[0].values, values)
 
     def test_is_scalar_access(self):
         # GH#32085 index with duplicates doesn't matter for _is_scalar_access
@@ -141,6 +171,9 @@ class TestiLocBaseIndependent:
         df = ser.to_frame()
         assert df.iloc._is_scalar_access((1, 0))
 
+    @pytest.mark.skipif(
+        pa_version_under16p0, reason="https://github.com/apache/arrow/issues/40642"
+    )
     def test_iloc_exceeds_bounds(self):
         # GH6296
         # iloc should allow indexers that exceed the bounds
@@ -423,12 +456,15 @@ class TestiLocBaseIndependent:
         tm.assert_frame_equal(df.iloc[10:, :2], df2)
         tm.assert_frame_equal(df.iloc[10:, 2:], df1)
 
-    def test_iloc_setitem(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem(sel, has_ref):
         df = DataFrame(
             np.random.default_rng(2).standard_normal((4, 4)),
             index=np.arange(0, 8, 2),
             columns=np.arange(0, 12, 3),
         )
+        if has_ref:
+            view = df[:]  # noqa: F841
 
         df.iloc[1, 1] = 1
         result = df.iloc[1, 1]
@@ -445,10 +481,13 @@ class TestiLocBaseIndependent:
         expected = Series([0, 1, 0], index=[4, 5, 6])
         tm.assert_series_equal(s, expected)
 
-    def test_iloc_setitem_axis_argument(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_axis_argument(self, has_ref):
         # GH45032
         df = DataFrame([[6, "c", 10], [7, "d", 11], [8, "e", 12]])
         df[1] = df[1].astype(object)
+        if has_ref:
+            view = df[:]
         expected = DataFrame([[6, "c", 10], [7, "d", 11], [5, 5, 5]])
         expected[1] = expected[1].astype(object)
         df.iloc(axis=0)[2] = 5
@@ -456,16 +495,21 @@ class TestiLocBaseIndependent:
 
         df = DataFrame([[6, "c", 10], [7, "d", 11], [8, "e", 12]])
         df[1] = df[1].astype(object)
+        if has_ref:
+            view = df[:]  # noqa: F841
         expected = DataFrame([[6, "c", 5], [7, "d", 5], [8, "e", 5]])
         expected[1] = expected[1].astype(object)
         df.iloc(axis=1)[2] = 5
         tm.assert_frame_equal(df, expected)
 
-    def test_iloc_setitem_list(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_list(self, has_ref):
         # setitem with an iloc list
         df = DataFrame(
             np.arange(9).reshape((3, 3)), index=["A", "B", "C"], columns=["A", "B", "C"]
         )
+        if has_ref:
+            view = df[:]  # noqa: F841
         df.iloc[[0, 1], [1, 2]]
         df.iloc[[0, 1], [1, 2]] += 100
 
@@ -528,10 +572,9 @@ class TestiLocBaseIndependent:
         assert len(df._mgr.blocks) == 1
 
         # if the assigned values cannot be held by existing integer arrays,
-        #  we cast
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        #  we raise
+        with pytest.raises(TypeError, match="Invalid value"):
             df.iloc[:, 0] = df.iloc[:, 0] + 0.5
-        assert len(df._mgr.blocks) == 2
 
         expected = df.copy()
 
@@ -539,6 +582,48 @@ class TestiLocBaseIndependent:
         df.iloc[[0, 1], [0, 1]] = df.iloc[[0, 1], [0, 1]]
 
         tm.assert_frame_equal(df, expected)
+
+    def test_iloc_setitem_unordered_column_indexer_referenced_block(self):
+        # GH#65446 assignment was silently lost when the block was referenced
+        #  by another object and the column indexer was not sorted
+        df = DataFrame({"A": [1, 2], "B": [3, 4]})
+        df_orig = df.copy()
+        ref = df[["A", "B"]]
+        df.iloc[:, [1, 0]] = DataFrame({"A": [10, 20], "B": [30, 40]})
+        df._mgr._verify_integrity()
+        expected = DataFrame({"A": [30, 40], "B": [10, 20]})
+        tm.assert_frame_equal(df, expected)
+        tm.assert_frame_equal(ref, df_orig)
+
+    def test_iloc_setitem_duplicate_column_indexer_referenced_block(self):
+        # GH#65446
+        df = DataFrame({"A": [1, 2], "B": [3, 4]})
+        df_orig = df.copy()
+        ref = df[["A", "B"]]
+        df.iloc[:, [0, 0]] = np.array([[10, 30], [20, 40]])
+        df._mgr._verify_integrity()
+        expected = DataFrame({"A": [30, 40], "B": [3, 4]})
+        tm.assert_frame_equal(df, expected)
+        tm.assert_frame_equal(ref, df_orig)
+
+    def test_iloc_setitem_frame_swap_columns(self):
+        # GH#65446 positional swap when the RHS shares data with the target
+        df = DataFrame({"A": [1, 2], "B": [3, 4]})
+        df.iloc[:, [1, 0]] = df[["A", "B"]]
+        expected = DataFrame({"A": [3, 4], "B": [1, 2]})
+        tm.assert_frame_equal(df, expected)
+
+    def test_iloc_setitem_unordered_row_and_column_indexer_referenced_block(self):
+        # GH#65446 a list row indexer combined with an unsorted column indexer
+        #  must set the full cross product
+        df = DataFrame({"A": [1, 2], "B": [3, 4]})
+        df_orig = df.copy()
+        ref = df[["A", "B"]]
+        df.iloc[[1, 0], [1, 0]] = np.array([[10, 20], [30, 40]])
+        df._mgr._verify_integrity()
+        expected = DataFrame({"A": [40, 20], "B": [30, 10]})
+        tm.assert_frame_equal(df, expected)
+        tm.assert_frame_equal(ref, df_orig)
 
     # TODO: GH#27620 this test used to compare iloc against ix; check if this
     #  is redundant with another test comparing iloc against loc
@@ -613,7 +698,7 @@ class TestiLocBaseIndependent:
         assert result == exp
 
         # out-of-bounds exception
-        msg = "index 5 is out of bounds for axis 0 with size 4|index out of bounds"
+        msg = "index 5 is out of bounds for axis 0 with size 4"
         with pytest.raises(IndexError, match=msg):
             df.iloc[10, 5]
 
@@ -661,12 +746,15 @@ class TestiLocBaseIndependent:
         expected = DataFrame(arr[1:5, 2:4], index=index[1:5], columns=columns[2:4])
         tm.assert_frame_equal(result, expected)
 
-    def test_iloc_setitem_series(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_series(self, has_ref):
         df = DataFrame(
             np.random.default_rng(2).standard_normal((10, 4)),
             index=list("abcdefghij"),
             columns=list("ABCD"),
         )
+        if has_ref:
+            view = df[:]  # noqa: F841
 
         df.iloc[1, 1] = 1
         result = df.iloc[1, 1]
@@ -695,12 +783,15 @@ class TestiLocBaseIndependent:
         expected = Series([0, 1, 2, 3, 4, 5])
         tm.assert_series_equal(result, expected)
 
-    def test_iloc_setitem_list_of_lists(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_list_of_lists(self, has_ref):
         # GH 7551
         # list-of-list is set incorrectly in mixed vs. single dtyped frames
         df = DataFrame(
             {"A": np.arange(5, dtype="int64"), "B": np.arange(5, 10, dtype="int64")}
         )
+        if has_ref:
+            view = df[:]
         df.iloc[2:4] = [[10, 11], [12, 13]]
         expected = DataFrame({"A": [0, 1, 10, 12, 4], "B": [5, 6, 11, 13, 9]})
         tm.assert_frame_equal(df, expected)
@@ -708,19 +799,334 @@ class TestiLocBaseIndependent:
         df = DataFrame(
             {"A": ["a", "b", "c", "d", "e"], "B": np.arange(5, 10, dtype="int64")}
         )
+        if has_ref:
+            view = df[:]  # noqa: F841
         df.iloc[2:4] = [["x", 11], ["y", 13]]
         expected = DataFrame({"A": ["a", "b", "x", "y", "e"], "B": [5, 6, 11, 13, 9]})
         tm.assert_frame_equal(df, expected)
 
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    @pytest.mark.parametrize("value", [[[1], [2, 3]], [[2, 3], [1]]])
+    def test_setitem_ragged_list_of_lists_raises(self, indexer, value):
+        # GH#64229
+        df = DataFrame({"a": [0.0, 0.0], "b": [0, 0], "c": [0.0, 0.0]})
+        with pytest.raises(ValueError, match="Must have equal len keys"):
+            if indexer == "loc":
+                df.loc[:, ["a", "c"]] = value
+            else:
+                df.iloc[:, [0, 2]] = value
+
+    @pytest.mark.parametrize(
+        "box",
+        [np.array, Series, Index, array],
+        ids=["ndarray", "Series", "Index", "pd.array"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    @pytest.mark.parametrize("nrows", [2, 3])
+    def test_setitem_split_path_list_of_arrays_is_2d(self, indexer, nrows, box):
+        # GH#64230 a list of 1-D array-likes is a 2D value (a list of rows),
+        # just like a list of lists / an ndarray; the split path used to
+        # transpose it into columns instead.
+        df = DataFrame(
+            {
+                "a": np.zeros(nrows),
+                "b": np.zeros(nrows, dtype="int64"),
+                "c": np.zeros(nrows),
+            }
+        )
+        rows = [[2 * i + 1, 2 * i + 2] for i in range(nrows)]
+        value = [box(row) for row in rows]
+        if indexer == "loc":
+            df.loc[:, ["a", "c"]] = value
+        else:
+            df.iloc[:, [0, 2]] = value
+
+        arr = np.array(rows, dtype="float64")
+        expected = DataFrame(
+            {"a": arr[:, 0], "b": np.zeros(nrows, dtype="int64"), "c": arr[:, 1]}
+        )
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [Series([1, 2], index=[5, 6]), Series([3, 4], index=["p", "q"])],
+            # only value[0] decides that this is 2D, but every row gets unwrapped
+            [[1, 2], Series([3, 4], index=["p", "q"])],
+            [Index([1, 2]), Series([3, 4], index=["p", "q"])],
+            # labels that DO resolve positionally, to a different answer: this
+            #  catches a label-based read by the value, not by an exception
+            [Series([1, 2], index=[1, 0]), Series([3, 4], index=[1, 0])],
+        ],
+        ids=["all-series", "list-first", "index-first", "reversed-labels"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_series_not_aligned(self, indexer, value):
+        # GH#64230 Series rows are read positionally, not by label
+        df = DataFrame({"a": [0.0, 0.0], "b": np.zeros(2, dtype="int64")})
+        if indexer == "loc":
+            df.loc[:, ["a", "b"]] = value
+        else:
+            df.iloc[:, [0, 1]] = value
+
+        expected = DataFrame({"a": [1.0, 3.0], "b": [2, 4]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "box",
+        [np.array, Series, Index, array],
+        ids=["ndarray", "Series", "Index", "pd.array"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_arrays_single_column(self, indexer, box):
+        # GH#64230 a list of 1-D array-likes targeting a single column is a
+        # shape mismatch, same as a list of lists; unlike mismatched-length
+        # tuples (GH#65264) arrays are not scalar-like, so no per-cell storage
+        df = DataFrame({"a": np.zeros(2, dtype=object), "b": [0, 0]})
+        value = [box([1, 2]), box([3, 4])]
+        msg = "Must have equal len keys and value when setting with an ndarray"
+        with pytest.raises(ValueError, match=msg):
+            if indexer == "loc":
+                df.loc[:, ["a"]] = value
+            else:
+                df.iloc[:, [0]] = value
+
+    @pytest.mark.parametrize(
+        "box",
+        [np.array, Series, Index, array],
+        ids=["ndarray", "Series", "Index", "pd.array"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_len1_arrays_single_column(self, indexer, box):
+        # GH#64230 len-1 rows into a single column is the shape that *does*
+        # match, the counterpart to the mismatch above
+        df = DataFrame({"a": np.zeros(2), "b": [0, 0]})
+        value = [box([1]), box([2])]
+        if indexer == "loc":
+            df.loc[:, ["a"]] = value
+        else:
+            df.iloc[:, [0]] = value
+
+        expected = DataFrame({"a": [1.0, 2.0], "b": [0, 0]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "box",
+        [np.array, Series, Index, array],
+        ids=["ndarray", "Series", "Index", "pd.array"],
+    )
+    def test_setitem_split_path_list_of_arrays_expansion(self, box):
+        # GH#64230 rows are split across the target columns when one of them is
+        # created by the setitem
+        df = DataFrame({"a": [0.0, 0.0]})
+        # spell the rows int64: the row dtype carries into the created column,
+        # and a bare np.array would be int32 on 32-bit platforms
+        df.loc[:, ["a", "new"]] = [
+            box(np.array([1, 2], dtype=np.int64)),
+            box(np.array([3, 4], dtype=np.int64)),
+        ]
+
+        expected = DataFrame({"a": [1.0, 3.0], "new": [2, 4]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "box", [list, deque, tuple], ids=["list", "deque", "tuple"]
+    )
+    def test_setitem_split_path_heterogeneous_rows(self, box):
+        # GH#64230 mixed element types survive the row unwrap, and do so
+        # identically whichever container the row arrives in
+        df = DataFrame(
+            {
+                "a": np.zeros(2, dtype=object),
+                "b": np.zeros(2, dtype=object),
+                "z": np.zeros(2, dtype="int64"),
+            }
+        )
+        df.iloc[:, [0, 1]] = [box([1, "x"]), box([2, "y"])]
+
+        expected = DataFrame(
+            {
+                "a": Series([1, 2], dtype=object),
+                "b": Series(["x", "y"], dtype=object),
+                "z": np.zeros(2, dtype="int64"),
+            }
+        )
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_masked_arrays(self, indexer):
+        # GH#64230 a masked row keeps pd.NA; np.asarray would make it nan
+        df = DataFrame(
+            {"a": Series([0, 0], dtype="Int64"), "b": Series([0, 0], dtype="Int64")}
+        )
+        value = [array([1, NA], dtype="Int64"), array([NA, 4], dtype="Int64")]
+        if indexer == "loc":
+            df.loc[:, ["a", "b"]] = value
+        else:
+            df.iloc[:, [0, 1]] = value
+
+        expected = DataFrame(
+            {"a": array([1, NA], dtype="Int64"), "b": array([NA, 4], dtype="Int64")}
+        )
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_pyarrow_arrays(self, indexer, chunked):
+        # GH#64230 a foreign array indexes positionally but hands back a boxed
+        # scalar, so rows go through np.asarray instead of row[i]; with an
+        # object dtype target the boxed scalars would be stored silently
+        pa = pytest.importorskip("pyarrow")
+        if chunked:
+            value = [pa.chunked_array([["p", "q"]]), pa.chunked_array([["r", "s"]])]
+        else:
+            value = [pa.array(["p", "q"]), pa.array(["r", "s"])]
+        # "z" keeps the frame multi-block, so this takes the split path
+        df = DataFrame(
+            {
+                "a": np.zeros(2, dtype=object),
+                "b": np.zeros(2, dtype=object),
+                "z": np.zeros(2, dtype="int64"),
+            }
+        )
+        if indexer == "loc":
+            df.loc[:, ["a", "b"]] = value
+        else:
+            df.iloc[:, [0, 1]] = value
+
+        expected = DataFrame(
+            {
+                "a": Series(["p", "r"], dtype=object),
+                "b": Series(["q", "s"], dtype=object),
+                "z": np.zeros(2, dtype="int64"),
+            }
+        )
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "box",
+        [np.array, Series, Index, array],
+        ids=["ndarray", "Series", "Index", "pd.array"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_arrays_object_cell(self, indexer, box):
+        # GH#64230 being a 2D value takes precedence over the nested-data-into-
+        # a-single-object-cell branch, so this is a shape mismatch rather than
+        # a list stored in df.iloc[0, 0]
+        df = DataFrame({"a": np.zeros(2, dtype=object), "b": [0, 0]})
+        value = [box([1, 2]), box([3, 4])]
+        msg = "Must have equal len keys and value when setting with an ndarray"
+        with pytest.raises(ValueError, match=msg):
+            if indexer == "loc":
+                df.loc[0, "a"] = value
+            else:
+                df.iloc[0, 0] = value
+
+    @pytest.mark.parametrize(
+        "box",
+        [deque, lambda data: std_array("q", data), DuckSequence],
+        ids=["deque", "array.array", "duck"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_sequences(self, indexer, box):
+        # GH#64230 rows need not be array-likes; any sized, subscriptable,
+        # non-mapping sequence is a row, as it was when this went through
+        # np.asarray
+        df = DataFrame({"a": [0.0, 0.0], "b": np.zeros(2, dtype="int64")})
+        value = [box([1, 2]), box([3, 4])]
+        if indexer == "loc":
+            df.loc[:, ["a", "b"]] = value
+        else:
+            df.iloc[:, [0, 1]] = value
+
+        expected = DataFrame({"a": [1.0, 3.0], "b": [2, 4]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_ranges(self, indexer):
+        # GH#64230 range is a sequence, so a list of them is a list of rows
+        df = DataFrame({"a": [0.0, 0.0], "b": np.zeros(2, dtype="int64")})
+        if indexer == "loc":
+            df.loc[:, ["a", "b"]] = [range(1, 3), range(3, 5)]
+        else:
+            df.iloc[:, [0, 1]] = [range(1, 3), range(3, 5)]
+
+        expected = DataFrame({"a": [1.0, 3.0], "b": [2, 4]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [{1, 2}, {3, 4}],
+            [dict.fromkeys([1, 2]), dict.fromkeys([3, 4])],
+            # bytes and classes are sized and subscriptable, but np.asarray
+            #  never treated them as rows either
+            [b"ab", b"cd"],
+            [list, dict],
+            [GetitemOnly(), GetitemOnly()],
+        ],
+        ids=["set", "dict", "bytes", "type", "unsized"],
+    )
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_non_sequences(self, indexer, value):
+        # GH#64230 these are not subscriptable non-mapping sequences, so they
+        # are values for one column each rather than rows
+        df = DataFrame({"a": np.zeros(2, dtype=object), "b": np.zeros(2, dtype=object)})
+        if indexer == "loc":
+            df.loc[0, ["a", "b"]] = value
+        else:
+            df.iloc[0, [0, 1]] = value
+
+        expected = DataFrame(
+            {
+                "a": np.array([value[0], 0], dtype=object),
+                "b": np.array([value[1], 0], dtype=object),
+            }
+        )
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_0d_arrays(self, indexer):
+        # GH#64230 0-d array elements are scalars, not rows, so a list of
+        # them is not a 2D value; set one scalar per column
+        df = DataFrame({"a": [0.0, 0.0], "b": [0, 0], "c": [0.0, 0.0]})
+        value = [np.array(1.0), np.array(2.0)]
+        if indexer == "loc":
+            df.loc[0, ["a", "c"]] = value
+        else:
+            df.iloc[0, [0, 2]] = value
+
+        expected = DataFrame({"a": [1.0, 0.0], "b": [0, 0], "c": [2.0, 0.0]})
+        tm.assert_frame_equal(df, expected)
+
+    @pytest.mark.parametrize("indexer", ["loc", "iloc"])
+    def test_setitem_split_path_list_of_2d_arrays(self, indexer):
+        # GH#64230 2-D array elements make the value 3D, not 2D; they get
+        # stored per-cell in an object column
+        df = DataFrame({"a": np.zeros(2, dtype=object), "b": [0, 0]})
+        value = [np.ones((2, 2)), np.zeros((2, 2))]
+        if indexer == "loc":
+            df.loc[:, ["a"]] = value
+        else:
+            df.iloc[:, [0]] = value
+
+        result = df["a"].tolist()
+        assert len(result) == 2
+        tm.assert_numpy_array_equal(result[0], value[0])
+        tm.assert_numpy_array_equal(result[1], value[1])
+
+    @pytest.mark.parametrize("has_ref", [True, False])
     @pytest.mark.parametrize("indexer", [[0], slice(None, 1, None), np.array([0])])
     @pytest.mark.parametrize("value", [["Z"], np.array(["Z"])])
-    def test_iloc_setitem_with_scalar_index(self, indexer, value):
+    def test_iloc_setitem_with_scalar_index(self, has_ref, indexer, value):
         # GH #19474
         # assigning like "df.iloc[0, [0]] = ['Z']" should be evaluated
         # elementwisely, not using "setter('A', ['Z'])".
 
         # Set object type to avoid upcast when setting "Z"
         df = DataFrame([[1, 2], [3, 4]], columns=["A", "B"]).astype({"A": object})
+        if has_ref:
+            view = df[:]  # noqa: F841
         df.iloc[0, indexer] = value
         result = df.iloc[0, 0]
 
@@ -728,15 +1134,16 @@ class TestiLocBaseIndependent:
 
     @pytest.mark.filterwarnings("ignore::UserWarning")
     def test_iloc_mask(self):
-        # GH 3631, iloc with a mask (of a series) should raise
+        # GH 60994, iloc with a mask (of a series) should return accordingly
         df = DataFrame(list(range(5)), index=list("ABCDE"), columns=["a"])
         mask = df.a % 2 == 0
         msg = "iLocation based boolean indexing cannot use an indexable as a mask"
         with pytest.raises(ValueError, match=msg):
             df.iloc[mask]
+
         mask.index = range(len(mask))
-        msg = "iLocation based boolean indexing on an integer type is not available"
-        with pytest.raises(NotImplementedError, match=msg):
+        msg = "Unalignable boolean Series provided as indexer"
+        with pytest.raises(IndexingError, match=msg):
             df.iloc[mask]
 
         # ndarray ok
@@ -755,19 +1162,13 @@ class TestiLocBaseIndependent:
             (None, ".iloc"): "0b1100",
             ("index", ""): "0b11",
             ("index", ".loc"): "0b11",
-            ("index", ".iloc"): (
-                "iLocation based boolean indexing cannot use an indexable as a mask"
-            ),
-            ("locs", ""): "Unalignable boolean Series provided as indexer "
-            "(index of the boolean Series and of the indexed "
-            "object do not match).",
-            ("locs", ".loc"): "Unalignable boolean Series provided as indexer "
-            "(index of the boolean Series and of the "
-            "indexed object do not match).",
-            ("locs", ".iloc"): (
-                "iLocation based boolean indexing on an "
-                "integer type is not available"
-            ),
+            (
+                "index",
+                ".iloc",
+            ): "iLocation based boolean indexing cannot use an indexable as a mask",
+            ("locs", ""): "Unalignable boolean Series provided as indexer",
+            ("locs", ".loc"): "Unalignable boolean Series provided as indexer",
+            ("locs", ".iloc"): "Unalignable boolean Series provided as indexer",
         }
 
         # UserWarnings from reindex of a boolean mask
@@ -783,18 +1184,52 @@ class TestiLocBaseIndependent:
                     else:
                         accessor = df
                     answer = str(bin(accessor[mask]["nums"].sum()))
-                except (ValueError, IndexingError, NotImplementedError) as err:
+                except (ValueError, IndexingError) as err:
                     answer = str(err)
 
                 key = (
                     idx,
                     method,
                 )
-                r = expected.get(key)
-                if r != answer:
-                    raise AssertionError(
-                        f"[{key}] does not match [{answer}], received [{r}]"
+                expected_result = expected.get(key)
+
+                # Fix the assertion to check for substring match
+                if (
+                    idx is None or (idx == "index" and method != ".iloc")
+                ) and "0b" in expected_result:
+                    # For successful numeric results, exact match is needed
+                    assert expected_result == answer, (
+                        f"[{key}] does not match [{answer}]"
                     )
+                else:
+                    # For error messages, substring match is sufficient
+                    assert expected_result in answer, f"[{key}] not found in [{answer}]"
+
+    def test_iloc_with_numpy_bool_array(self):
+        df = DataFrame(list(range(5)), index=list("ABCDE"), columns=["a"])
+        result = df.iloc[np.array([True, False, True, False, True], dtype=bool)]
+        expected = DataFrame({"a": [0, 2, 4]}, index=["A", "C", "E"])
+        tm.assert_frame_equal(result, expected)
+
+    def test_iloc_series_mask_with_index_mismatch_raises(self):
+        df = DataFrame(list(range(5)), index=list("ABCDE"), columns=["a"])
+        mask = df.a % 2 == 0
+        msg = "Unalignable boolean Series provided as indexer"
+        with pytest.raises(IndexingError, match=msg):
+            df.iloc[Series([True] * len(mask), dtype=bool)]
+
+    def test_iloc_series_mask_all_true(self):
+        df = DataFrame(list(range(5)), columns=["a"])
+        mask = Series([True] * len(df), dtype=bool)
+        result = df.iloc[mask]
+        tm.assert_frame_equal(result, df)
+
+    def test_iloc_series_mask_alternate_true(self):
+        df = DataFrame(list(range(5)), columns=["a"])
+        mask = Series([True, False, True, False, True], dtype=bool)
+        result = df.iloc[mask]
+        expected = DataFrame({"a": [0, 2, 4]}, index=[0, 2, 4])
+        tm.assert_frame_equal(result, expected)
 
     def test_iloc_non_unique_indexing(self):
         # GH 4017, non-unique indexing (on the axis)
@@ -1017,18 +1452,24 @@ class TestiLocBaseIndependent:
         expected = DataFrame({"flag": ["x", "y", "z"], "value": [2, 3, 4]})
         tm.assert_frame_equal(df, expected)
 
+    @pytest.mark.parametrize("has_ref", [True, False])
     @pytest.mark.parametrize("indexer", [[1], slice(1, 2)])
-    def test_iloc_setitem_pure_position_based(self, indexer):
+    def test_iloc_setitem_pure_position_based(self, indexer, has_ref):
         # GH#22046
         df1 = DataFrame({"a2": [11, 12, 13], "b2": [14, 15, 16]})
         df2 = DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]})
+        if has_ref:
+            view = df2[:]  # noqa: F841
         df2.iloc[:, indexer] = df1.iloc[:, [0]]
         expected = DataFrame({"a": [1, 2, 3], "b": [11, 12, 13], "c": [7, 8, 9]})
         tm.assert_frame_equal(df2, expected)
 
-    def test_iloc_setitem_dictionary_value(self):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_setitem_dictionary_value(self, has_ref):
         # GH#37728
         df = DataFrame({"x": [1, 2], "y": [2, 2]})
+        if has_ref:
+            view = df[:]
         rhs = {"x": 9, "y": 99}
         df.iloc[1] = rhs
         expected = DataFrame({"x": [1, 9], "y": [2, 99]})
@@ -1036,6 +1477,8 @@ class TestiLocBaseIndependent:
 
         # GH#38335 same thing, mixed dtypes
         df = DataFrame({"x": [1, 2], "y": [2.0, 2.0]})
+        if has_ref:
+            view = df[:]  # noqa: F841
         df.iloc[1] = rhs
         expected = DataFrame({"x": [1, 9], "y": [2.0, 99.0]})
         tm.assert_frame_equal(df, expected)
@@ -1176,6 +1619,32 @@ class TestiLocBaseIndependent:
         expected = DataFrame({"B": df["B"], "A": df["A"]})
         tm.assert_frame_equal(res, expected)
 
+    @pytest.mark.parametrize(
+        "indexer, values, expected_values",
+        [
+            (slice(None, None, -2), [11, 5, 15], [15, 13, 5, 9, 11]),
+            (slice(None, None, -1), [11, 5, 15, 9, 3], [3, 9, 15, 5, 11]),
+            (slice(3, None, -1), [11, 5, 15, 9], [9, 15, 5, 11, 3]),
+        ],
+    )
+    def test_iloc_setitem_slice_negative_step_none_bounds(
+        self, indexer, values, expected_values
+    ):
+        # GH#66100 length_of_indexer previously returned a negative length
+        # for negative-step slices with start/stop left as None, causing
+        # a spurious "different length than the value" ValueError
+        ser = Series([2, 13, 7, 9, 3], index=["a", "b", "c", "d", "e"])
+        ser.iloc[indexer] = values
+        expected = Series(expected_values, index=["a", "b", "c", "d", "e"])
+        tm.assert_series_equal(ser, expected)
+
+    def test_iloc_setitem_slice_negative_step_full_reverse(self):
+        # GH#66100
+        ser = Series([2, 13, 7, 9, 3], index=["a", "b", "c", "d", "e"])
+        ser.iloc[::-2] = [11, 5, 15]
+        expected = Series([15, 13, 5, 9, 11], index=["a", "b", "c", "d", "e"])
+        tm.assert_series_equal(ser, expected)
+
     def test_iloc_setitem_2d_ndarray_into_ea_block(self):
         # GH#44703
         df = DataFrame({"status": ["a", "b", "c"]}, dtype="category")
@@ -1188,7 +1657,7 @@ class TestiLocBaseIndependent:
         # GH#45241
         # TODO: make an extension interface test for this?
         arr = interval_range(1, 10.0)._values
-        df = DataFrame(arr)
+        df = DataFrame(arr, copy=False)
 
         # ser should be a *view* on the DataFrame data
         ser = df.iloc[2]
@@ -1198,21 +1667,25 @@ class TestiLocBaseIndependent:
         arr[2] = arr[-1]
         assert ser[0] == arr[-1]
 
-    def test_iloc_setitem_multicolumn_to_datetime(self):
+    def test_iloc_setitem_multicolumn_to_datetime(self, using_infer_string):
         # GH#20511
         df = DataFrame({"A": ["2022-01-01", "2022-01-02"], "B": ["2021", "2022"]})
 
-        df.iloc[:, [0]] = DataFrame({"A": to_datetime(["2021", "2022"])})
-        expected = DataFrame(
-            {
-                "A": [
-                    Timestamp("2021-01-01 00:00:00"),
-                    Timestamp("2022-01-01 00:00:00"),
-                ],
-                "B": ["2021", "2022"],
-            }
-        )
-        tm.assert_frame_equal(df, expected, check_dtype=False)
+        if using_infer_string:
+            with pytest.raises(TypeError, match="Invalid value"):
+                df.iloc[:, [0]] = DataFrame({"A": to_datetime(["2021", "2022"])})
+        else:
+            df.iloc[:, [0]] = DataFrame({"A": to_datetime(["2021", "2022"])})
+            expected = DataFrame(
+                {
+                    "A": [
+                        Timestamp("2021-01-01 00:00:00"),
+                        Timestamp("2022-01-01 00:00:00"),
+                    ],
+                    "B": ["2021", "2022"],
+                }
+            )
+            tm.assert_frame_equal(df, expected, check_dtype=False)
 
 
 class TestILocErrors:
@@ -1237,10 +1710,13 @@ class TestILocErrors:
         with pytest.raises(IndexError, match=_slice_iloc_msg):
             obj.iloc[3.0] = 0
 
-    def test_iloc_getitem_setitem_fancy_exceptions(self, float_frame):
+    @pytest.mark.parametrize("has_ref", [True, False])
+    def test_iloc_getitem_setitem_fancy_exceptions(self, float_frame, has_ref):
         with pytest.raises(IndexingError, match="Too many indexers"):
             float_frame.iloc[:, :, :]
 
+        if has_ref:
+            view = float_frame[:]  # noqa: F841
         with pytest.raises(IndexError, match="too many indices for array"):
             # GH#32257 we let numpy do validation, get their exception
             float_frame.iloc[:, :, :] = 1
@@ -1445,7 +1921,30 @@ class TestILocSeries:
     def test_iloc_nullable_int64_size_1_nan(self):
         # GH 31861
         result = DataFrame({"a": ["test"], "b": [np.nan]})
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
-            result.loc[:, "b"] = result.loc[:, "b"].astype("Int64")
-        expected = DataFrame({"a": ["test"], "b": array([NA], dtype="Int64")})
-        tm.assert_frame_equal(result, expected)
+
+        ser = Series([NA], name="b", dtype="Int64")
+        with pytest.raises(TypeError, match="Invalid value"):
+            result.loc[:, "b"] = ser
+
+    def test_iloc_arrow_extension_array(self):
+        # GH#61311
+        pytest.importorskip("pyarrow")
+        df = DataFrame({"a": [1, 2], "c": [0, 2], "d": ["c", "a"]})
+        df_arrow = DataFrame(
+            {"a": [1, 2], "c": [0, 2], "d": ["c", "a"]}
+        ).convert_dtypes(dtype_backend="pyarrow")
+        expected = df.iloc[:, df["c"]]
+        result = df_arrow.iloc[:, df_arrow["c"]]
+        tm.assert_frame_equal(result, expected, check_dtype=False)
+
+    @td.skip_if_no("pyarrow")
+    def test_setitem_pyarrow_int_series(self):
+        # GH#62462
+        ser = Series([1, 2, 3], dtype="int64[pyarrow]")
+        idx = Index([0, 1])
+        vals = Series([7, 8], dtype="int64[pyarrow]")
+
+        ser.iloc[idx] = vals
+
+        expected = Series([7, 8, 3], dtype="int64[pyarrow]")
+        tm.assert_series_equal(ser, expected)

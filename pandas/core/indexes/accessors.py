@@ -14,6 +14,7 @@ import warnings
 import numpy as np
 
 from pandas._libs import lib
+from pandas.errors import Pandas4Warning
 from pandas.util._exceptions import find_stack_level
 
 from pandas.core.dtypes.common import (
@@ -44,6 +45,8 @@ from pandas.core.base import (
 )
 from pandas.core.indexes.datetimes import DatetimeIndex
 from pandas.core.indexes.timedeltas import TimedeltaIndex
+
+from pandas.tseries import frequencies
 
 if TYPE_CHECKING:
     from pandas import (
@@ -218,20 +221,23 @@ class ArrowTemporalProperties(PandasDelegate, PandasObject, NoNewAttributesMixin
             "in a future version this will return a Series containing python "
             "datetime.timedelta objects instead of an ndarray. To retain the "
             "old behavior, call `np.array` on the result",
-            FutureWarning,
+            Pandas4Warning,
             stacklevel=find_stack_level(),
         )
-        return cast(ArrowExtensionArray, self._parent.array)._dt_to_pytimedelta()
+        return cast("ArrowExtensionArray", self._parent.array)._dt_to_pytimedelta()
 
     def to_pydatetime(self) -> Series:
         # GH#20306
-        return cast(ArrowExtensionArray, self._parent.array)._dt_to_pydatetime()
+        result = cast("ArrowExtensionArray", self._parent.array)._dt_to_pydatetime()
+        result.index = self._parent.index
+        result.name = self._parent.name
+        return result
 
     def isocalendar(self) -> DataFrame:
         from pandas import DataFrame
 
         result = (
-            cast(ArrowExtensionArray, self._parent.array)
+            cast("ArrowExtensionArray", self._parent.array)
             ._dt_isocalendar()
             ._pa_array.combine_chunks()
         )
@@ -239,7 +245,8 @@ class ArrowTemporalProperties(PandasDelegate, PandasObject, NoNewAttributesMixin
             {
                 col: type(self._parent.array)(result.field(i))  # type: ignore[call-arg]
                 for i, col in enumerate(["year", "week", "day"])
-            }
+            },
+            index=self._parent.index,
         )
         return iso_calendar_df
 
@@ -247,31 +254,21 @@ class ArrowTemporalProperties(PandasDelegate, PandasObject, NoNewAttributesMixin
     def components(self) -> DataFrame:
         from pandas import DataFrame
 
-        components_df = DataFrame(
-            {
-                col: getattr(self._parent.array, f"_dt_{col}")
-                for col in [
-                    "days",
-                    "hours",
-                    "minutes",
-                    "seconds",
-                    "milliseconds",
-                    "microseconds",
-                    "nanoseconds",
-                ]
-            }
+        return (
+            DataFrame(cast("ArrowExtensionArray", self._parent.array)._dt_components)
+            .set_index(self._parent.index)
+            .__finalize__(self._parent)
         )
-        return components_df
 
 
 @delegate_names(
     delegate=DatetimeArray,
-    accessors=DatetimeArray._datetimelike_ops + ["unit"],
+    accessors=[*DatetimeArray._datetimelike_ops, "unit"],
     typ="property",
 )
 @delegate_names(
     delegate=DatetimeArray,
-    accessors=DatetimeArray._datetimelike_methods + ["as_unit"],
+    accessors=[*DatetimeArray._datetimelike_methods, "as_unit"],
     typ="method",
 )
 class DatetimeProperties(Properties):
@@ -285,7 +282,7 @@ class DatetimeProperties(Properties):
     0   2000-01-01 00:00:00
     1   2000-01-01 00:00:01
     2   2000-01-01 00:00:02
-    dtype: datetime64[ns]
+    dtype: datetime64[us]
     >>> seconds_series.dt.second
     0    0
     1    1
@@ -297,7 +294,7 @@ class DatetimeProperties(Properties):
     0   2000-01-01 00:00:00
     1   2000-01-01 01:00:00
     2   2000-01-01 02:00:00
-    dtype: datetime64[ns]
+    dtype: datetime64[us]
     >>> hours_series.dt.hour
     0    0
     1    1
@@ -309,7 +306,7 @@ class DatetimeProperties(Properties):
     0   2000-03-31
     1   2000-06-30
     2   2000-09-30
-    dtype: datetime64[ns]
+    dtype: datetime64[us]
     >>> quarters_series.dt.quarter
     0    1
     1    2
@@ -333,8 +330,8 @@ class DatetimeProperties(Properties):
 
         Returns
         -------
-        numpy.ndarray
-            Object dtype array containing native Python datetime objects.
+        Series
+            Series containing native Python datetime objects.
 
         See Also
         --------
@@ -346,7 +343,7 @@ class DatetimeProperties(Properties):
         >>> s
         0   2018-03-10
         1   2018-03-11
-        dtype: datetime64[ns]
+        dtype: datetime64[us]
 
         >>> s.dt.to_pydatetime()
         0    2018-03-10 00:00:00
@@ -369,15 +366,54 @@ class DatetimeProperties(Properties):
         # GH#20306
         from pandas import Series
 
-        return Series(self._get_values().to_pydatetime(), dtype=object)
+        return Series(
+            self._get_values().to_pydatetime(),
+            index=self._parent.index,
+            name=self._parent.name,
+            dtype=object,
+        )
 
     @property
     def freq(self):
-        return self._get_values().inferred_freq
+        """
+        Return a string representing a frequency generated by infer_freq.
+
+        .. deprecated:: 3.1.0
+            A future version of pandas will return a :class:`BaseOffset`
+            object (or ``None``) instead of a string. Use
+            ``pd.set_option('future.infer_freq_returns_offset', True)`` to
+            opt in to the future behavior.
+
+        Returns None if it can't autodetect the frequency.
+
+        See Also
+        --------
+        Series.dt.to_period : Cast to PeriodArray/PeriodIndex at a particular
+            frequency.
+
+        Examples
+        --------
+        >>> ser = pd.Series(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"])
+        >>> ser = pd.to_datetime(ser)
+        >>> ser.dt.freq
+        'D'
+
+        >>> ser = pd.Series(["2022-01-01", "2024-01-01", "2026-01-01", "2028-01-01"])
+        >>> ser = pd.to_datetime(ser)
+        >>> ser.dt.freq
+        '2YS-JAN'
+        """
+        return frequencies.maybe_convert_inferred_freq(
+            self._get_values()._inferred_freq_str, "Series.dt.freq"
+        )
 
     def isocalendar(self) -> DataFrame:
         """
         Calculate year, week, and day according to the ISO 8601 standard.
+
+        The ISO 8601 standard defines the first week of the year as the week
+        containing the first Thursday. This method returns a DataFrame with
+        columns for the ISO year, ISO week number, and ISO day of week.
 
         Returns
         -------
@@ -430,7 +466,7 @@ class TimedeltaProperties(Properties):
     0   0 days 00:00:01
     1   0 days 00:00:02
     2   0 days 00:00:03
-    dtype: timedelta64[ns]
+    dtype: timedelta64[us]
     >>> seconds_series.dt.seconds
     0    1
     1    2
@@ -459,14 +495,14 @@ class TimedeltaProperties(Properties):
 
         Examples
         --------
-        >>> s = pd.Series(pd.to_timedelta(np.arange(5), unit="d"))
+        >>> s = pd.Series(pd.to_timedelta(np.arange(5), unit="D"))
         >>> s
         0   0 days
         1   1 days
         2   2 days
         3   3 days
         4   4 days
-        dtype: timedelta64[ns]
+        dtype: timedelta64[s]
 
         >>> s.dt.to_pytimedelta()
         array([datetime.timedelta(0), datetime.timedelta(days=1),
@@ -479,7 +515,7 @@ class TimedeltaProperties(Properties):
             "in a future version this will return a Series containing python "
             "datetime.timedelta objects instead of an ndarray. To retain the "
             "old behavior, call `np.array` on the result",
-            FutureWarning,
+            Pandas4Warning,
             stacklevel=find_stack_level(),
         )
         return self._get_values().to_pytimedelta()
@@ -489,9 +525,19 @@ class TimedeltaProperties(Properties):
         """
         Return a Dataframe of the components of the Timedeltas.
 
+        Each row of the DataFrame corresponds to a Timedelta in the original
+        Series and contains the individual components (days, hours, minutes,
+        seconds, milliseconds, microseconds, nanoseconds) of the Timedelta.
+
         Returns
         -------
         DataFrame
+
+        See Also
+        --------
+        TimedeltaIndex.components : Return a DataFrame of the individual resolution
+            components of the Timedeltas.
+        Series.dt.total_seconds : Return the total number of seconds in the duration.
 
         Examples
         --------
@@ -502,7 +548,7 @@ class TimedeltaProperties(Properties):
         2   0 days 00:00:02
         3   0 days 00:00:03
         4   0 days 00:00:04
-        dtype: timedelta64[ns]
+        dtype: timedelta64[s]
         >>> s.dt.components
            days  hours  minutes  seconds  milliseconds  microseconds  nanoseconds
         0     0      0        0        0             0             0            0
@@ -519,7 +565,35 @@ class TimedeltaProperties(Properties):
 
     @property
     def freq(self):
-        return self._get_values().inferred_freq
+        """
+        Return a string representing a frequency generated by infer_freq.
+
+        .. deprecated:: 3.1.0
+            A future version of pandas will return a :class:`BaseOffset`
+            object (or ``None``) instead of a string. Use
+            ``pd.set_option('future.infer_freq_returns_offset', True)`` to
+            opt in to the future behavior.
+
+        Returns None if it can't autodetect the frequency.
+
+        See Also
+        --------
+        Series.dt.components : Return a DataFrame of the components of the
+            Timedeltas.
+
+        Examples
+        --------
+        >>> ser = pd.Series(pd.timedelta_range("1 day", periods=4))
+        >>> ser.dt.freq
+        'D'
+
+        >>> ser = pd.Series(pd.to_timedelta(["1 day", "3 days", "10 days"]))
+        >>> ser.dt.freq is None
+        True
+        """
+        return frequencies.maybe_convert_inferred_freq(
+            self._get_values()._inferred_freq_str, "Series.dt.freq"
+        )
 
 
 @delegate_names(
@@ -594,6 +668,15 @@ class CombinedDatetimelikeProperties(
 ):
     """
     Accessor object for Series values' datetime-like, timedelta and period properties.
+
+    This accessor provides access to properties and methods for datetime-like,
+    timedelta, and period data types. It can be used with Series containing
+    datetime64, timedelta64, or period data.
+
+    Parameters
+    ----------
+    data : Series
+        Series with datetime-like, timedelta, or period dtype.
 
     See Also
     --------

@@ -22,7 +22,7 @@ class TestPeriodIndexAsType:
         with pytest.raises(TypeError, match=msg):
             idx.astype(dtype)
 
-    def test_astype_conversion(self):
+    def test_astype_conversion(self, using_infer_string):
         # GH#13149, GH#13209
         idx = PeriodIndex(["2016-05-16", "NaT", NaT, np.nan], freq="D", name="idx")
 
@@ -41,7 +41,12 @@ class TestPeriodIndexAsType:
         tm.assert_index_equal(result, expected)
 
         result = idx.astype(str)
-        expected = Index([str(x) for x in idx], name="idx", dtype=object)
+        if using_infer_string:
+            expected = Index(
+                [str(x) if x is not NaT else None for x in idx], name="idx", dtype="str"
+            )
+        else:
+            expected = Index([str(x) for x in idx], name="idx", dtype=object)
         tm.assert_index_equal(result, expected)
 
         idx = period_range("1990", "2009", freq="Y", name="idx")
@@ -62,18 +67,18 @@ class TestPeriodIndexAsType:
 
         exp = np.array([], dtype=object)
         tm.assert_numpy_array_equal(idx.astype(object).values, exp)
-        tm.assert_numpy_array_equal(idx._mpl_repr(), exp)
+        tm.assert_numpy_array_equal(idx._mpl_repr(), idx.asi8)
 
         idx = PeriodIndex(["2011-01", NaT], freq="M")
 
         exp = np.array([Period("2011-01", freq="M"), NaT], dtype=object)
         tm.assert_numpy_array_equal(idx.astype(object).values, exp)
-        tm.assert_numpy_array_equal(idx._mpl_repr(), exp)
+        tm.assert_numpy_array_equal(idx._mpl_repr(), idx.asi8)
 
         exp = np.array([Period("2011-01-01", freq="D"), NaT], dtype=object)
         idx = PeriodIndex(["2011-01-01", NaT], freq="D")
         tm.assert_numpy_array_equal(idx.astype(object).values, exp)
-        tm.assert_numpy_array_equal(idx._mpl_repr(), exp)
+        tm.assert_numpy_array_equal(idx._mpl_repr(), idx.asi8)
 
     # TODO: de-duplicate this version (from test_ops) with the one above
     # (from test_period)

@@ -5,16 +5,22 @@ from collections import (
 from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
+import itertools
 
 import numpy as np
 import pytest
 
-from pandas.errors import InvalidIndexError
+from pandas.errors import (
+    InvalidIndexError,
+    Pandas4Warning,
+)
 
 import pandas as pd
 from pandas import (
     DataFrame,
     Index,
+    Interval,
+    IntervalIndex,
     MultiIndex,
     PeriodIndex,
     RangeIndex,
@@ -49,37 +55,37 @@ class TestConcatenate:
         df2 = DataFrame(np.random.default_rng(2).integers(0, 10, size=4).reshape(4, 1))
         df3 = DataFrame({5: "foo"}, index=range(4))
 
-        # These are actual copies.
-        result = concat([df, df2, df3], axis=1)
-        for arr in result._mgr.arrays:
-            assert arr.base is not None
-
-        # These are the same.
         result = concat([df, df2, df3], axis=1)
 
-        for arr in result._mgr.arrays:
+        for block in result._mgr.blocks:
+            arr = block.values
             if arr.dtype.kind == "f":
-                assert arr.base is df._mgr.arrays[0].base
+                assert arr.base is df._mgr.blocks[0].values.base
             elif arr.dtype.kind in ["i", "u"]:
-                assert arr.base is df2._mgr.arrays[0].base
+                assert arr.base is df2._mgr.blocks[0].values.base
             elif arr.dtype == object:
                 assert arr.base is not None
+            elif arr.dtype == "string":
+                tm.shares_memory(arr, df3._mgr.blocks[0].values)
 
         # Float block was consolidated.
         df4 = DataFrame(np.random.default_rng(2).standard_normal((4, 1)))
         result = concat([df, df2, df3, df4], axis=1)
-        for arr in result._mgr.arrays:
+        for blocks in result._mgr.blocks:
+            arr = blocks.values
             if arr.dtype.kind == "f":
                 # this is a view on some array in either df or df4
                 assert any(
-                    np.shares_memory(arr, other)
-                    for other in df._mgr.arrays + df4._mgr.arrays
+                    np.shares_memory(arr, block.values)
+                    for block in itertools.chain(df._mgr.blocks, df4._mgr.blocks)
                 )
             elif arr.dtype.kind in ["i", "u"]:
-                assert arr.base is df2._mgr.arrays[0].base
+                assert arr.base is df2._mgr.blocks[0].values.base
             elif arr.dtype == object:
                 # this is a view on df3
-                assert any(np.shares_memory(arr, other) for other in df3._mgr.arrays)
+                assert any(
+                    np.shares_memory(arr, block.values) for block in df3._mgr.blocks
+                )
 
     def test_concat_with_group_keys(self):
         # axis=0
@@ -123,7 +129,9 @@ class TestConcatenate:
         )
 
         tm.assert_index_equal(result.columns.levels[0], Index(level, name="group_key"))
-        tm.assert_index_equal(result.columns.levels[1], Index([0, 1, 2, 3]))
+        tm.assert_index_equal(
+            result.columns.levels[1], RangeIndex(start=0, stop=4, step=1), exact=True
+        )
 
         assert result.columns.names == ["group_key", None]
 
@@ -168,9 +176,9 @@ class TestConcatenate:
         )
         expected = concat([df, df2, df, df2])
         exp_index = MultiIndex(
-            levels=levels + [[0]],
+            levels=[*levels, [0]],
             codes=[[0, 0, 1, 1], [0, 1, 0, 1], [0, 0, 0, 0]],
-            names=names + [None],
+            names=[*names, None],
         )
         expected.index = exp_index
 
@@ -325,6 +333,8 @@ class TestConcatenate:
     def test_concat_mixed_objs_index_names(self):
         # Test row-wise concat for mixed series/frames with distinct names
         # GH2385, GH15047
+        # GH #60723 & GH #56257 (Updated the test case,
+        # as the above GH PR ones were incorrect)
 
         index = date_range("01-Jan-2013", periods=10, freq="h")
         arr = np.arange(10, dtype="int64")
@@ -340,8 +350,11 @@ class TestConcatenate:
         result = concat([s1, df, s2])
         tm.assert_frame_equal(result, expected)
 
-        # Rename all series to 0 when ignore_index=True
-        expected = DataFrame(np.tile(arr, 3).reshape(-1, 1), columns=[0])
+        expected = DataFrame(
+            np.kron(np.where(np.identity(3) == 1, 1, np.nan), arr).T,
+            index=np.arange(30, dtype=np.int64),
+            columns=["foo", 0, "bar"],
+        )
         result = concat([s1, df, s2], ignore_index=True)
         tm.assert_frame_equal(result, expected)
 
@@ -428,7 +441,9 @@ class TestConcatenate:
         # to join with union
         # these two are of different length!
         left = concat([ts1, ts2], join="outer", axis=1)
-        right = concat([ts2, ts1], join="outer", axis=1)
+        msg = "Sorting by default when concatenating all DatetimeIndex is deprecated"
+        with tm.assert_produces_warning(Pandas4Warning, match=msg):
+            right = concat([ts2, ts1], join="outer", axis=1)
 
         assert len(left) == len(right)
 
@@ -696,7 +711,7 @@ def test_concat_repeated_keys(keys, integrity):
     # GH: 20816
     series_list = [Series({"a": 1}), Series({"b": 2}), Series({"c": 3})]
     result = concat(series_list, keys=keys, verify_integrity=integrity)
-    tuples = list(zip(keys, ["a", "b", "c"]))
+    tuples = list(zip(keys, ["a", "b", "c"], strict=True))
     expected = Series([1, 2, 3], index=MultiIndex.from_tuples(tuples))
     tm.assert_series_equal(result, expected)
 
@@ -931,3 +946,143 @@ def test_concat_with_series_and_frame_returns_rangeindex_columns():
     result = concat([ser, df])
     expected = DataFrame([0, 1, 2], index=[0, 0, 1])
     tm.assert_frame_equal(result, expected, check_column_type=True)
+
+
+def test_concat_with_moot_ignore_index_and_keys():
+    df1 = DataFrame([[0]])
+    df2 = DataFrame([[42]])
+
+    ignore_index = True
+    keys = ["df1", "df2"]
+    msg = f"Cannot set {ignore_index=} and specify keys. Either should be used."
+    with pytest.raises(ValueError, match=msg):
+        concat([df1, df2], keys=keys, ignore_index=ignore_index)
+
+
+@pytest.mark.parametrize(
+    "inputs, ignore_index, axis, expected",
+    [
+        # Concatenating DataFrame and named Series without ignore_index
+        (
+            [DataFrame({"a": [0, 1], "b": [2, 3]}), Series([4, 5], name="c")],
+            False,
+            0,
+            DataFrame(
+                {
+                    "a": [0, 1, None, None],
+                    "b": [2, 3, None, None],
+                    "c": [None, None, 4, 5],
+                },
+                index=[0, 1, 0, 1],
+            ),
+        ),
+        # Concatenating DataFrame and named Series with ignore_index
+        (
+            [DataFrame({"a": [0, 1], "b": [2, 3]}), Series([4, 5], name="c")],
+            True,
+            0,
+            DataFrame(
+                {
+                    "a": [0, 1, None, None],
+                    "b": [2, 3, None, None],
+                    "c": [None, None, 4, 5],
+                },
+                index=[0, 1, 2, 3],
+            ),
+        ),
+        # Concatenating DataFrame and unnamed Series along columns
+        (
+            [DataFrame({"a": [0, 1], "b": [2, 3]}), Series([4, 5]), Series([4, 5])],
+            False,
+            1,
+            DataFrame({"a": [0, 1], "b": [2, 3], 0: [4, 5], 1: [4, 5]}, index=[0, 1]),
+        ),
+        # Concatenating DataFrame and unnamed Series along columns with ignore_index
+        (
+            [DataFrame({"a": [0, 1], "b": [2, 3]}), Series([4, 5]), Series([4, 5])],
+            True,
+            1,
+            DataFrame({0: [0, 1], 1: [2, 3], 2: [4, 5], 3: [4, 5]}, index=[0, 1]),
+        ),
+    ],
+)
+def test_concat_of_series_and_frame(inputs, ignore_index, axis, expected):
+    # GH #60723 and #56257
+    result = concat(inputs, ignore_index=ignore_index, axis=axis)
+    tm.assert_frame_equal(result, expected)
+
+
+def test_concat_keys_overlapping_intervalindex_level():
+    # GH#64825 an overlapping IntervalIndex passed as levels is not
+    #  unique-as-index, but its values are distinct, so concat should resolve it
+    value_index = IntervalIndex.from_tuples([(0.0, 1.0), (1.0, 2.0)], name="foo")
+    level_index = IntervalIndex.from_tuples([(0.0, 10.0), (0.0, 20.0)], name="bar")
+    values = [
+        Series([1.0, 3.0], name=Interval(0.0, 10.0), index=value_index),
+        Series([5.0, 7.0], name=Interval(0.0, 20.0), index=value_index),
+    ]
+    result = concat(values, keys=level_index, levels=[level_index], names=["bar"])
+    expected = Series(
+        [1.0, 3.0, 5.0, 7.0],
+        index=MultiIndex.from_product([level_index, value_index]),
+    )
+    tm.assert_series_equal(result, expected)
+
+
+def test_concat_mismatched_nlevels_with_keys_gh25413():
+    # GH#25413
+    df1 = DataFrame(np.arange(12).reshape(4, 3), columns=["A", "B", "C"])
+    df2 = DataFrame(
+        np.arange(12).reshape(4, 3),
+        columns=["A", "B", "C"],
+        index=MultiIndex.from_product([["a", "b"], [1, 2]]),
+    )
+    msg = "Cannot concat indices that do not have the same number of levels"
+    with pytest.raises(ValueError, match=msg):
+        concat([df1, df2], keys=[1, 2])
+
+
+def test_concat_keys_overlapping_intervalindex_value_index():
+    # GH#64825 the per-Series index is itself an overlapping IntervalIndex
+    value_index = IntervalIndex.from_tuples([(0.0, 10.0), (0.0, 20.0)], name="foo")
+    level_index = IntervalIndex.from_tuples([(0.0, 10.0), (0.0, 20.0)], name="bar")
+    values = [
+        Series([1.0, 3.0], name=Interval(0.0, 10.0), index=value_index),
+        Series([5.0, 7.0], name=Interval(0.0, 20.0), index=value_index),
+    ]
+    result = concat(values, keys=level_index, levels=[level_index], names=["bar"])
+    expected = Series(
+        [1.0, 3.0, 5.0, 7.0],
+        index=MultiIndex.from_product([level_index, value_index]),
+    )
+    tm.assert_series_equal(result, expected)
+
+
+def test_concat_keys_duplicate_index_equal_lengths():
+    # GH#20565 concat with keys where each frame shares an identical duplicate
+    #  index must dedupe the shared level rather than repeat it per position
+    df1 = DataFrame(np.arange(6).reshape(3, 2), columns=["A", "B"], index=["Z1"] * 3)
+    df2 = DataFrame(np.arange(6).reshape(3, 2), columns=["A", "B"], index=["Z1"] * 3)
+    result = concat([df1, df2], keys=["Key1", "Key2"], names=["KEY", "ID"])
+    expected_index = MultiIndex(
+        levels=[["Key1", "Key2"], ["Z1"]],
+        codes=[[0, 0, 0, 1, 1, 1], [0, 0, 0, 0, 0, 0]],
+        names=["KEY", "ID"],
+    )
+    tm.assert_index_equal(result.index, expected_index)
+
+
+def test_concat_tuple_index_series_axis1_not_multiindex():
+    # GH#24783 concatenating Series whose index labels are tuples must keep a
+    #  flat Index of those tuples, not explode them into a MultiIndex
+    s1 = Series([1.0, 2.0], index=[("a", "b"), ("x", "y", "z")], name="s1")
+    s2 = Series([3.0, 4.0], index=[("a", "b"), ("j", "k", "l")], name="s2")
+    result = concat([s1, s2], axis=1, sort=False)
+    assert result.index.nlevels == 1
+    index_arr = np.empty(3, dtype=object)
+    index_arr[:] = [("a", "b"), ("x", "y", "z"), ("j", "k", "l")]
+    expected = DataFrame(
+        {"s1": [1.0, 2.0, np.nan], "s2": [3.0, np.nan, 4.0]},
+        index=Index(index_arr),
+    )
+    tm.assert_frame_equal(result, expected)

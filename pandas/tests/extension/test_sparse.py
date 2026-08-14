@@ -24,12 +24,12 @@ from pandas.arrays import SparseArray
 from pandas.tests.extension import base
 
 
-def make_data(fill_value):
+def make_data(fill_value, n: int):
     rng = np.random.default_rng(2)
     if np.isnan(fill_value):
-        data = rng.uniform(size=100)
+        data = rng.uniform(size=n)
     else:
-        data = rng.integers(1, 100, size=100, dtype=int)
+        data = rng.integers(1, 100, size=n, dtype=int)
         if data[0] == data[1]:
             data[0] += 1
 
@@ -44,14 +44,14 @@ def dtype():
 
 @pytest.fixture(params=[0, np.nan])
 def data(request):
-    """Length-100 PeriodArray for semantics test."""
-    res = SparseArray(make_data(request.param), fill_value=request.param)
+    """Length-10 SparseArray for semantics test."""
+    res = SparseArray(make_data(request.param, 10), fill_value=request.param)
     return res
 
 
 @pytest.fixture
 def data_for_twos():
-    return SparseArray(np.ones(100) * 2)
+    return SparseArray(np.ones(10) * 2)
 
 
 @pytest.fixture(params=[0, np.nan])
@@ -66,7 +66,7 @@ def data_repeated(request):
 
     def gen(count):
         for _ in range(count):
-            yield SparseArray(make_data(request.param), fill_value=request.param)
+            yield SparseArray(make_data(request.param, 10), fill_value=request.param)
 
     return gen
 
@@ -97,12 +97,11 @@ def data_for_compare(request):
 
 
 class TestSparseArray(base.ExtensionTests):
-    def _supports_reduction(self, obj, op_name: str) -> bool:
-        return True
+    def _honors_copy_keyword(self, data) -> bool:
+        return False
 
-    @pytest.mark.parametrize("skipna", [True, False])
-    def test_reduce_series_numeric(self, data, all_numeric_reductions, skipna, request):
-        if all_numeric_reductions in [
+    def _supports_reduction(self, obj, op_name: str) -> bool:
+        if op_name in [
             "prod",
             "median",
             "var",
@@ -111,19 +110,10 @@ class TestSparseArray(base.ExtensionTests):
             "skew",
             "kurt",
         ]:
-            mark = pytest.mark.xfail(
-                reason="This should be viable but is not implemented"
-            )
-            request.node.add_marker(mark)
-        elif (
-            all_numeric_reductions in ["sum", "max", "min", "mean"]
-            and data.dtype.kind == "f"
-            and not skipna
-        ):
-            mark = pytest.mark.xfail(reason="getting a non-nan float")
-            request.node.add_marker(mark)
-
-        super().test_reduce_series_numeric(data, all_numeric_reductions, skipna)
+            # These should be viable but are not implemented
+            return False
+        else:
+            return True
 
     @pytest.mark.parametrize("skipna", [True, False])
     def test_reduce_frame(self, data, all_numeric_reductions, skipna, request):
@@ -139,13 +129,6 @@ class TestSparseArray(base.ExtensionTests):
             mark = pytest.mark.xfail(
                 reason="This should be viable but is not implemented"
             )
-            request.node.add_marker(mark)
-        elif (
-            all_numeric_reductions in ["sum", "max", "min", "mean"]
-            and data.dtype.kind == "f"
-            and not skipna
-        ):
-            mark = pytest.mark.xfail(reason="ExtensionArray NA mask are different")
             request.node.add_marker(mark)
 
         super().test_reduce_frame(data, all_numeric_reductions, skipna)
@@ -326,6 +309,22 @@ class TestSparseArray(base.ExtensionTests):
     def test_searchsorted(self, performance_warning, data_for_sorting, as_series):
         with tm.assert_produces_warning(performance_warning, check_stacklevel=False):
             super().test_searchsorted(data_for_sorting, as_series)
+
+    def test_sort_inplace(self, data_for_sorting):
+        # https://github.com/pandas-dev/pandas/issues/64977
+        with pytest.raises(NotImplementedError):
+            data_for_sorting.sort()
+
+    def test_sort_inplace_descending(self, data_for_sorting):
+        # https://github.com/pandas-dev/pandas/issues/64977
+        with pytest.raises(NotImplementedError):
+            data_for_sorting.sort(ascending=False)
+
+    @pytest.mark.parametrize("na_position", ["first", "last"])
+    def test_sort_inplace_na_position(self, data_missing_for_sorting, na_position):
+        # https://github.com/pandas-dev/pandas/issues/64977
+        with pytest.raises(NotImplementedError):
+            data_missing_for_sorting.sort(na_position=na_position)
 
     def test_shift_0_periods(self, data):
         # GH#33856 shifting with periods=0 should return a copy, not same obj

@@ -26,8 +26,8 @@ def dtype():
 
 @pytest.fixture
 def data():
-    """Length-100 PeriodArray for semantics test."""
-    data = make_data()
+    """Length-10 JSONArray for semantics test."""
+    data = make_data(10)
 
     # Why the while loop? NumPy is unable to construct an ndarray from
     # equal-length ndarrays. Many of our operations involve coercing the
@@ -36,7 +36,7 @@ def data():
     # the first two elements, so that's what we'll check.
 
     while len(data[0]) == len(data[1]):
-        data = make_data()
+        data = make_data(10)
 
     return JSONArray(data)
 
@@ -140,6 +140,16 @@ class TestJSONArray(base.ExtensionTests):
         return super().test_unstack(data, index)
 
     @pytest.mark.xfail(reason="Setting a dict as a scalar")
+    def test_fillna_scalar(self, data_missing):
+        """We treat dictionaries as a mapping in fillna, not a scalar."""
+        super().test_fillna_scalar(data_missing)
+
+    @pytest.mark.xfail(reason="Setting a dict as a scalar")
+    def test_fillna_readonly(self, data_missing):
+        """We treat dictionaries as a mapping in fillna, not a scalar."""
+        super().test_fillna_readonly(data_missing)
+
+    @pytest.mark.xfail(reason="Setting a dict as a scalar")
     def test_fillna_series(self):
         """We treat dictionaries as a mapping in fillna, not a scalar."""
         super().test_fillna_series()
@@ -189,13 +199,10 @@ class TestJSONArray(base.ExtensionTests):
                 data_missing, limit_area, input_ilocs, expected_ilocs
             )
 
-    @unhashable
-    def test_value_counts(self, all_data, dropna):
+    def test_value_counts(self, all_data, dropna, request):
+        if len(all_data) == 10 or dropna:
+            request.applymarker(unhashable)
         super().test_value_counts(all_data, dropna)
-
-    @unhashable
-    def test_value_counts_with_normalize(self, data):
-        super().test_value_counts_with_normalize(data)
 
     @unhashable
     def test_sort_values_frame(self):
@@ -206,12 +213,6 @@ class TestJSONArray(base.ExtensionTests):
     def test_combine_le(self, data_repeated):
         super().test_combine_le(data_repeated)
 
-    @pytest.mark.xfail(
-        reason="combine for JSONArray not supported - "
-        "may pass depending on random data",
-        strict=False,
-        raises=AssertionError,
-    )
     def test_combine_first(self, data):
         super().test_combine_first(data)
 
@@ -291,6 +292,12 @@ class TestJSONArray(base.ExtensionTests):
             request.applymarker(mark)
         super().test_arith_frame_with_scalar(data, all_arithmetic_operators)
 
+    def test_compare_scalar(self, data, comparison_op, request):
+        if comparison_op.__name__ in ["eq", "ne"]:
+            mark = pytest.mark.xfail(reason="Comparison methods not implemented")
+            request.applymarker(mark)
+        super().test_compare_scalar(data, comparison_op)
+
     def test_compare_array(self, data, comparison_op, request):
         if comparison_op.__name__ in ["eq", "ne"]:
             mark = pytest.mark.xfail(reason="Comparison methods not implemented")
@@ -359,18 +366,25 @@ class TestJSONArray(base.ExtensionTests):
             request.applymarker(mark)
         super().test_setitem_integer_array(data, idx, box_in_series)
 
-    @pytest.mark.xfail(reason="list indices must be integers or slices, not NAType")
     @pytest.mark.parametrize(
-        "idx, box_in_series",
+        "idx",
         [
-            ([0, 1, 2, pd.NA], False),
-            pytest.param(
-                [0, 1, 2, pd.NA], True, marks=pytest.mark.xfail(reason="GH-31948")
-            ),
-            (pd.array([0, 1, 2, pd.NA], dtype="Int64"), False),
-            (pd.array([0, 1, 2, pd.NA], dtype="Int64"), True),
+            [0, 1, 2, pd.NA],
+            pd.array([0, 1, 2, pd.NA], dtype="Int64"),
         ],
-        ids=["list-False", "list-True", "integer-array-False", "integer-array-True"],
+        ids=["list", "integer-array"],
+    )
+    @pytest.mark.parametrize(
+        "box_in_series",
+        [
+            True,
+            pytest.param(
+                False,
+                marks=pytest.mark.xfail(
+                    reason="list indices must be integers or slices, not NAType"
+                ),
+            ),
+        ],
     )
     def test_setitem_integer_with_missing_raises(self, data, idx, box_in_series):
         super().test_setitem_integer_with_missing_raises(data, idx, box_in_series)
@@ -378,12 +392,6 @@ class TestJSONArray(base.ExtensionTests):
     @pytest.mark.xfail(reason="Fails to raise")
     def test_setitem_scalar_key_sequence_raise(self, data):
         super().test_setitem_scalar_key_sequence_raise(data)
-
-    def test_setitem_with_expansion_dataframe_column(self, data, full_indexer, request):
-        if "full_slice" in request.node.name:
-            mark = pytest.mark.xfail(reason="slice is not iterable")
-            request.applymarker(mark)
-        super().test_setitem_with_expansion_dataframe_column(data, full_indexer)
 
     @pytest.mark.xfail(reason="slice is not iterable")
     def test_setitem_frame_2d_values(self, data):
@@ -396,10 +404,12 @@ class TestJSONArray(base.ExtensionTests):
     def test_setitem_mask_broadcast(self, data, setter):
         super().test_setitem_mask_broadcast(data, setter)
 
-    @pytest.mark.xfail(
-        reason="cannot set using a slice indexer with a different length"
-    )
-    def test_setitem_slice(self, data, box_in_series):
+    def test_setitem_slice(self, data, box_in_series, request):
+        if box_in_series:
+            mark = pytest.mark.xfail(
+                reason="cannot set using a slice indexer with a different length"
+            )
+            request.applymarker(mark)
         super().test_setitem_slice(data, box_in_series)
 
     @pytest.mark.xfail(reason="slice object is not iterable")
@@ -410,13 +420,15 @@ class TestJSONArray(base.ExtensionTests):
     def test_setitem_slice_mismatch_length_raises(self, data):
         super().test_setitem_slice_mismatch_length_raises(data)
 
-    @pytest.mark.xfail(reason="slice object is not iterable")
-    def test_setitem_slice_array(self, data):
-        super().test_setitem_slice_array(data)
-
     @pytest.mark.xfail(reason="Fail to raise")
     def test_setitem_invalid(self, data, invalid_scalar):
         super().test_setitem_invalid(data, invalid_scalar)
+
+    @pytest.mark.xfail(
+        reason="result readonly flag is incorrect and does not support na_value"
+    )
+    def test_readonly_propagates_to_numpy_array_method(self, data):
+        super().test_readonly_propagates_to_numpy_array_method(data)
 
     @pytest.mark.xfail(reason="only integer scalar arrays can be converted")
     def test_setitem_2d_values(self, data):
@@ -426,6 +438,19 @@ class TestJSONArray(base.ExtensionTests):
     @pytest.mark.parametrize("engine", ["c", "python"])
     def test_EA_types(self, engine, data, request):
         super().test_EA_types(engine, data, request)
+
+    @pytest.mark.xfail(
+        raises=AssertionError,
+        reason="JSONArray does not support roundtrip via JSON",
+    )
+    def test_json_roundtrip(self, data):
+        # GH 65127
+        # JSONArray does not support roundtrip as during JSON serialization each element
+        # of the array is packed into another dictionary ``{"data": element}`` with
+        # element being a dictionary itself, and during deserialization these
+        # dictionaries are not unpacked again, so the JSONArray cannot be reconstructed
+        # with the simple deserialization in the test.
+        super().test_json_roundtrip(data)
 
 
 def custom_assert_series_equal(left, right, *args, **kwargs):

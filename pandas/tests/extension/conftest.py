@@ -14,7 +14,7 @@ def dtype():
 @pytest.fixture
 def data():
     """
-    Length-100 array for this type.
+    Length-10 array for this type.
 
     * data[0] and data[1] should both be non missing
     * data[0] and data[1] should not be equal
@@ -25,7 +25,7 @@ def data():
 @pytest.fixture
 def data_for_twos(dtype):
     """
-    Length-100 array in which all the elements are two.
+    Length-10 array in which all the elements are two.
 
     Call pytest.skip in your fixture if the dtype does not support divmod.
     """
@@ -212,3 +212,30 @@ def invalid_scalar(data):
     If the array can hold any item (i.e. object dtype), then use pytest.skip.
     """
     return object.__new__(object)
+
+
+@pytest.fixture(
+    params=[
+        # numeric reductions
+        "count",
+        "sum",
+        "max",
+        "min",
+        "mean",
+        "prod",
+        "std",
+        "var",
+        "median",
+        "kurt",
+        "skew",
+        "sem",
+        # boolean reductions
+        "all",
+        "any",
+    ]
+)
+def all_reductions(request):
+    """
+    Fixture for all (boolean + numeric) reduction names.
+    """
+    return request.param

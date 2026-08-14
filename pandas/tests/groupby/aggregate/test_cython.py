@@ -5,6 +5,8 @@ test cython .agg behavior
 import numpy as np
 import pytest
 
+from pandas.errors import Pandas4Warning
+
 from pandas.core.dtypes.common import (
     is_float_dtype,
     is_integer_dtype,
@@ -105,7 +107,9 @@ def test_cython_agg_nothing_to_agg():
 
     result = frame[["b"]].groupby(frame["a"]).mean(numeric_only=True)
     expected = DataFrame(
-        [], index=frame["a"].sort_values().drop_duplicates(), columns=[]
+        [],
+        index=frame["a"].sort_values().drop_duplicates(),
+        columns=Index([], dtype="str"),
     )
     tm.assert_frame_equal(result, expected)
 
@@ -145,11 +149,11 @@ def test_cython_agg_return_dict():
 
 def test_cython_fail_agg():
     dr = bdate_range("1/1/2000", periods=50)
-    ts = Series(["A", "B", "C", "D", "E"] * 10, index=dr)
+    ts = Series(["A", "B", "C", "D", "E"] * 10, dtype=object, index=dr)
 
     grouped = ts.groupby(lambda x: x.month)
     summed = grouped.sum()
-    expected = grouped.agg(np.sum)
+    expected = grouped.agg(np.sum).astype(object)
     tm.assert_series_equal(summed, expected)
 
 
@@ -285,7 +289,7 @@ def test_read_only_buffer_source_agg(agg):
             "species": ["setosa", "setosa", "setosa", "setosa", "setosa"],
         }
     )
-    df._mgr.arrays[0].flags.writeable = False
+    df._mgr.blocks[0].values.flags.writeable = False
 
     result = df.groupby(["species"]).agg({"sepal_length": agg})
     expected = df.copy().groupby(["species"]).agg({"sepal_length": agg})
@@ -324,7 +328,8 @@ def test_cython_agg_nullable_int(op_name):
         convert_integer = False
     else:
         convert_integer = True
-    expected = expected.convert_dtypes(convert_integer=convert_integer)
+    with tm.assert_produces_warning(Pandas4Warning):
+        expected = expected.convert_dtypes(convert_integer=convert_integer)
     tm.assert_series_equal(result, expected)
 
 

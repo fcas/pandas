@@ -468,6 +468,34 @@ def test_mismatched_length_cmp_op(cons):
         left & right
 
 
+@pytest.mark.parametrize("op", [operator.and_, operator.or_, operator.xor])
+def test_logical_op_uneven_length_series(op):
+    # GH#32119 a logical op between a sparse Series and a differently-indexed
+    #  Series aligns (introducing NA) and must match the non-sparse result
+    #  instead of raising an uninformative error.
+    sparse = pd.Series(SparseArray(np.arange(10)))
+    dense = pd.Series(np.arange(11))
+
+    result = op(sparse == 5, dense == 5)
+    expected = op(pd.Series(np.arange(10)) == 5, dense == 5)
+
+    assert isinstance(result.dtype, SparseDtype)
+    tm.assert_series_equal(result.astype(bool), expected)
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ([0, 1, 2], [0, 1, 2, 3]),
+        ([0, 1, 2, 3], [0, 1, 2]),
+    ],
+)
+def test_mismatched_length_arith_op(a, b, all_arithmetic_functions):
+    op = all_arithmetic_functions
+    with pytest.raises(AssertionError, match=f"length mismatch: {len(a)} vs. {len(b)}"):
+        op(SparseArray(a, fill_value=0), np.array(b))
+
+
 @pytest.mark.parametrize("op", ["add", "sub", "mul", "truediv", "floordiv", "pow"])
 @pytest.mark.parametrize("fill_value", [np.nan, 3])
 def test_binary_operators(op, fill_value):

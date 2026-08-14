@@ -17,16 +17,17 @@ for box in tr.params[0]:
 """
 
 from datetime import (
+    UTC,
     timedelta,
     timezone,
 )
+import zoneinfo
 
 from dateutil.tz import (
     gettz,
     tzlocal,
 )
 import numpy as np
-import pytz
 
 try:
     from pandas._libs.tslibs import ints_to_pydatetime
@@ -36,9 +37,9 @@ except ImportError:
 tzlocal_obj = tzlocal()
 _tzs = [
     None,
-    timezone.utc,
+    UTC,
     timezone(timedelta(minutes=60)),
-    pytz.timezone("US/Pacific"),
+    zoneinfo.ZoneInfo("US/Pacific"),
     gettz("Asia/Tokyo"),
     tzlocal_obj,
 ]

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from pandas._libs import lib
+from pandas.errors import Pandas4Warning
 
 import pandas as pd
 from pandas import (
@@ -104,8 +105,12 @@ class TestDataFrameReshape:
         )
         tm.assert_frame_equal(result, expected)
 
-        # From a series with incorrect data type for fill_value
-        result = data.unstack(fill_value=0.5)
+        msg = (
+            "Using a fill_value that cannot be held in the existing dtype is deprecated"
+        )
+        with tm.assert_produces_warning(Pandas4Warning, match=msg):
+            # From a series with incorrect data type for fill_value
+            result = data.unstack(fill_value=0.5)
         expected = DataFrame(
             {"a": [1, 0.5, 5], "b": [2, 4, 0.5]}, index=["x", "y", "z"], dtype=float
         )
@@ -160,8 +165,12 @@ class TestDataFrameReshape:
         expected["B"] = expected["B"].astype(np.float64)
         tm.assert_frame_equal(result, expected)
 
-        # From a dataframe with incorrect data type for fill_value
-        result = df.unstack(fill_value=0.5)
+        msg = (
+            "Using a fill_value that cannot be held in the existing dtype is deprecated"
+        )
+        with tm.assert_produces_warning(Pandas4Warning, match=msg):
+            # From a dataframe with incorrect data type for fill_value
+            result = df.unstack(fill_value=0.5)
 
         rows = [[1, 3, 2, 4], [0.5, 5, 0.5, 6], [7, 0.5, 8, 0.5]]
         expected = DataFrame(rows, index=list("xyz"), dtype=float)
@@ -255,8 +264,8 @@ class TestDataFrameReshape:
         result = data.unstack()
         expected = DataFrame(
             {
-                "a": pd.Categorical(list("axa"), categories=list("abc")),
-                "b": pd.Categorical(list("bcx"), categories=list("abc")),
+                "a": pd.Categorical(["a", None, "a"], categories=list("abc")),
+                "b": pd.Categorical(["b", "c", None], categories=list("abc")),
             },
             index=list("xyz"),
         )
@@ -656,7 +665,11 @@ class TestDataFrameReshape:
         df2["D"] = "foo"
         df3 = df2.unstack("B")
         result = df3.dtypes
-        dtype = "string" if using_infer_string else np.dtype("object")
+        dtype = (
+            pd.StringDtype(na_value=np.nan)
+            if using_infer_string
+            else np.dtype("object")
+        )
         expected = Series(
             [np.dtype("float64")] * 2 + [dtype] * 2,
             index=MultiIndex.from_arrays(
@@ -714,13 +727,13 @@ class TestDataFrameReshape:
         df = DataFrame([[1, 0]] * 3, index=idx)
 
         result = df.unstack()
-        exp_col = MultiIndex.from_product([[0, 1], ["A", "B", "C"]])
+        exp_col = MultiIndex.from_product([range(2), ["A", "B", "C"]])
         expected = DataFrame([[1, 1, 1, 0, 0, 0]], index=["a"], columns=exp_col)
         tm.assert_frame_equal(result, expected)
         assert (result.columns.levels[1] == idx.levels[1]).all()
 
         # Unused items on both levels
-        levels = [[0, 1, 7], [0, 1, 2, 3]]
+        levels = [range(3), range(4)]
         codes = [[0, 0, 1, 1], [0, 2, 0, 2]]
         idx = MultiIndex(levels, codes)
         block = np.arange(4).reshape(2, 2)
@@ -752,7 +765,7 @@ class TestDataFrameReshape:
         result = df.unstack(level=level)
         exp_data = np.zeros(18) * np.nan
         exp_data[idces] = data
-        cols = MultiIndex.from_product([[0, 1], col_level])
+        cols = MultiIndex.from_product([range(2), col_level])
         expected = DataFrame(exp_data.reshape(3, 6), index=idx_level, columns=cols)
         tm.assert_frame_equal(result, expected)
 
@@ -851,13 +864,13 @@ class TestDataFrameReshape:
         assert udf.notna().values.sum() == len(df)
         mk_list = lambda a: list(a) if isinstance(a, tuple) else [a]
         rows, cols = udf["jolie"].notna().values.nonzero()
-        for i, j in zip(rows, cols):
+        for i, j in zip(rows, cols, strict=True):
             left = sorted(udf["jolie"].iloc[i, j].split("."))
             right = mk_list(udf["jolie"].index[i]) + mk_list(udf["jolie"].columns[j])
             right = sorted(map(cast, right))
             assert left == right
 
-    @pytest.mark.parametrize("idx", itertools.permutations(["1st", "2nd", "3rd"]))
+    @pytest.mark.parametrize("idx", list(itertools.permutations(["1st", "2nd", "3rd"])))
     @pytest.mark.parametrize("lev", list(range(3)))
     @pytest.mark.parametrize("col", ["4th", "5th"])
     def test_unstack_nan_index_repeats(self, idx, lev, col):
@@ -915,7 +928,7 @@ class TestDataFrameReshape:
         assert udf.notna().values.sum() == 2 * len(df)
         mk_list = lambda a: list(a) if isinstance(a, tuple) else [a]
         rows, cols = udf[col].notna().values.nonzero()
-        for i, j in zip(rows, cols):
+        for i, j in zip(rows, cols, strict=True):
             left = sorted(udf[col].iloc[i, j].split("."))
             right = mk_list(udf[col].index[i]) + mk_list(udf[col].columns[j])
             right = sorted(map(cast, right))
@@ -933,7 +946,7 @@ class TestDataFrameReshape:
             [3, 0, 1, 2, np.nan, np.nan, np.nan, np.nan],
             [np.nan, np.nan, np.nan, np.nan, 4, 5, 6, 7],
         ]
-        vals = list(map(list, zip(*vals)))
+        vals = list(map(list, zip(*vals, strict=True)))
         idx = Index([np.nan, 0, 1, 2, 4, 5, 6, 7], name="B")
         cols = MultiIndex(
             levels=[["C"], ["a", "b"]], codes=[[0, 0], [0, 1]], names=[None, "A"]
@@ -992,7 +1005,9 @@ class TestDataFrameReshape:
         )
 
         right = DataFrame(vals, columns=cols, index=idx)
-        tm.assert_frame_equal(left, right)
+        # the unstacked columns level has no freq while the date_range expected
+        #  does; freq is not what this test checks
+        tm.assert_frame_equal(left, right, check_freq=False)
 
     def test_unstack_nan_index4(self):
         # GH4862
@@ -1062,12 +1077,12 @@ class TestDataFrameReshape:
         # GH 8039
         t = datetime(2014, 1, 1)
         df = DataFrame([1, 2, 3, 4], columns=MultiIndex.from_tuples([(t, "A", "B")]))
-        warn = None if future_stack else FutureWarning
+        warn = None if future_stack else Pandas4Warning
         msg = "The previous implementation of stack is deprecated"
         with tm.assert_produces_warning(warn, match=msg):
             result = df.stack(future_stack=future_stack)
 
-        eidx = MultiIndex.from_product([(0, 1, 2, 3), ("B",)])
+        eidx = MultiIndex.from_product([range(4), ("B",)])
         ecols = MultiIndex.from_tuples([(t, "A")])
         expected = DataFrame([1, 2, 3, 4], index=eidx, columns=ecols)
         tm.assert_frame_equal(result, expected)
@@ -1150,7 +1165,7 @@ class TestDataFrameReshape:
         expected = DataFrame(
             [[0, 2], [1, np.nan], [3, 5], [4, np.nan]],
             index=MultiIndex(
-                levels=[[0, 1], ["u", "x", "y", "z"]],
+                levels=[range(2), ["u", "x", "y", "z"]],
                 codes=[[0, 0, 1, 1], [1, 3, 1, 3]],
                 names=[None, "Lower"],
             ),
@@ -1201,7 +1216,7 @@ class TestDataFrameReshape:
         s_cidx = pd.CategoricalIndex(labels, ordered=ordered)
         expected_data = sorted(data) if future_stack else data
         expected = Series(
-            expected_data, index=MultiIndex.from_product([[0], s_cidx, cidx2])
+            expected_data, index=MultiIndex.from_product([range(1), s_cidx, cidx2])
         )
 
         tm.assert_series_equal(result, expected)
@@ -1214,7 +1229,7 @@ class TestDataFrameReshape:
         cat = pd.Categorical(["a", "a", "b", "c"])
         df = DataFrame({"A": cat, "B": cat})
         result = df.stack(future_stack=future_stack)
-        index = MultiIndex.from_product([[0, 1, 2, 3], ["A", "B"]])
+        index = MultiIndex.from_product([range(4), ["A", "B"]])
         expected = Series(
             pd.Categorical(["a", "a", "a", "a", "b", "b", "c", "c"]), index=index
         )
@@ -1298,7 +1313,7 @@ class TestDataFrameReshape:
     @pytest.mark.parametrize("level", [0, "baz"])
     def test_unstack_swaplevel_sortlevel(self, level):
         # GH 20994
-        mi = MultiIndex.from_product([[0], ["d", "c"]], names=["bar", "baz"])
+        mi = MultiIndex.from_product([range(1), ["d", "c"]], names=["bar", "baz"])
         df = DataFrame([[0, 2], [1, 3]], index=mi, columns=["B", "A"])
         df.columns.name = "foo"
 
@@ -1321,14 +1336,33 @@ def test_unstack_sort_false(frame_or_series, dtype):
         [("two", "z", "b"), ("two", "y", "a"), ("one", "z", "b"), ("one", "y", "a")]
     )
     obj = frame_or_series(np.arange(1.0, 5.0), index=index, dtype=dtype)
+
+    result = obj.unstack(level=0, sort=False)
+
+    if frame_or_series is DataFrame:
+        expected_columns = MultiIndex.from_tuples([(0, "two"), (0, "one")])
+    else:
+        expected_columns = ["two", "one"]
+    expected = DataFrame(
+        [[1.0, 3.0], [2.0, 4.0]],
+        index=MultiIndex.from_tuples([("z", "b"), ("y", "a")]),
+        columns=expected_columns,
+        dtype=dtype,
+    )
+    tm.assert_frame_equal(result, expected)
+
     result = obj.unstack(level=-1, sort=False)
 
     if frame_or_series is DataFrame:
-        expected_columns = MultiIndex.from_tuples([(0, "b"), (0, "a")])
+        expected_columns = MultiIndex(
+            levels=[range(1), ["b", "a"]], codes=[[0, 0], [0, 1]]
+        )
     else:
         expected_columns = ["b", "a"]
+
+    item = pd.NA if dtype == "Float64" else np.nan
     expected = DataFrame(
-        [[1.0, np.nan], [np.nan, 2.0], [3.0, np.nan], [np.nan, 4.0]],
+        [[1.0, item], [item, 2.0], [3.0, item], [item, 4.0]],
         columns=expected_columns,
         index=MultiIndex.from_tuples(
             [("two", "z"), ("two", "y"), ("one", "z"), ("one", "y")]
@@ -1340,7 +1374,9 @@ def test_unstack_sort_false(frame_or_series, dtype):
     result = obj.unstack(level=[1, 2], sort=False)
 
     if frame_or_series is DataFrame:
-        expected_columns = MultiIndex.from_tuples([(0, "z", "b"), (0, "y", "a")])
+        expected_columns = MultiIndex(
+            levels=[range(1), ["z", "y"], ["b", "a"]], codes=[[0, 0], [0, 1], [0, 1]]
+        )
     else:
         expected_columns = MultiIndex.from_tuples([("z", "b"), ("y", "a")])
     expected = DataFrame(
@@ -1350,6 +1386,186 @@ def test_unstack_sort_false(frame_or_series, dtype):
         dtype=dtype,
     )
     tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "levels2, expected_columns",
+    [
+        (
+            [None, 1, 2, 3],
+            [("value", np.nan), ("value", 1), ("value", 2), ("value", 3)],
+        ),
+        (
+            [1, None, 2, 3],
+            [("value", 1), ("value", np.nan), ("value", 2), ("value", 3)],
+        ),
+        (
+            [1, 2, None, 3],
+            [("value", 1), ("value", 2), ("value", np.nan), ("value", 3)],
+        ),
+        (
+            [1, 2, 3, None],
+            [("value", 1), ("value", 2), ("value", 3), ("value", np.nan)],
+        ),
+    ],
+    ids=["nan=first", "nan=second", "nan=third", "nan=last"],
+)
+def test_unstack_sort_false_nan(levels2, expected_columns):
+    # GH#61221
+    levels1 = ["b", "a"]
+    index = MultiIndex.from_product([levels1, levels2], names=["level1", "level2"])
+    df = DataFrame({"value": [0, 1, 2, 3, 4, 5, 6, 7]}, index=index)
+    result = df.unstack(level="level2", sort=False)
+    expected_data = [[0, 4], [1, 5], [2, 6], [3, 7]]
+    expected = DataFrame(
+        dict(zip(expected_columns, expected_data, strict=True)),
+        index=Index(["b", "a"], name="level1"),
+        columns=MultiIndex.from_tuples(expected_columns, names=[None, "level2"]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_sort_false_unsorted_with_gaps():
+    # Unsorted MI with missing combinations, unstacking non-last level
+    # with sort=False. Exercises the identity=False, mask_all=False,
+    # sort=False path through _Unstacker.get_new_values.
+    index = MultiIndex.from_tuples([("b", 1), ("a", 2), ("b", 2)], names=["x", "y"])
+    ser = Series([10, 20, 30], index=index)
+    result = ser.unstack(level=0, sort=False)
+    expected = DataFrame(
+        {"b": [10.0, 30.0], "a": [np.nan, 20.0]},
+        index=Index([1, 2], name="y"),
+        columns=Index(["b", "a"], name="x"),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("frame", [False, True])
+@pytest.mark.parametrize("dtype", ["int64", "Int64", "int64[pyarrow]"])
+def test_unstack_sort_false_multiple_remaining_levels(frame, dtype):
+    # GH#62816 With two or more levels left over, the result rows
+    #  follow first appearance, but the values were laid out in lexicographic
+    #  order of the remaining codes, so they landed under the wrong labels.
+    #  The extension dtypes go through BlockManager.unstack instead of
+    #  _Unstacker.get_result, which consumes the same machinery differently.
+    if dtype == "int64[pyarrow]":
+        pytest.importorskip("pyarrow")
+    index = MultiIndex.from_tuples(
+        [(2, "a", 9), (1, "c", 9), (2, "c", 9)], names=["x", "y", "z"]
+    )
+    obj = Series([10, 20, 30], index=index, dtype=dtype)
+    expected_index = MultiIndex.from_tuples(
+        [(2, "a"), (1, "c"), (2, "c")], names=["x", "y"]
+    )
+    if frame:
+        obj = obj.to_frame("val")
+        expected_columns = MultiIndex.from_tuples([("val", 9)], names=[None, "z"])
+    else:
+        expected_columns = Index([9], name="z")
+
+    result = obj.unstack(level=2, sort=False)
+
+    expected = DataFrame(
+        [[10], [20], [30]],
+        index=expected_index,
+        columns=expected_columns,
+        dtype=dtype,
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_sort_false_multiple_remaining_levels_with_gaps():
+    # GH#62816 As above, but with missing combinations so the values go through
+    #  the masked fill path rather than the plain reshape.
+    index = MultiIndex.from_tuples(
+        [(2, "a", 9), (1, "c", 8), (2, "c", 9), (1, "c", 9)], names=["x", "y", "z"]
+    )
+    ser = Series([10.0, 20.0, 30.0, 40.0], index=index)
+
+    result = ser.unstack(level=2, sort=False)
+
+    expected = DataFrame(
+        [[10.0, np.nan], [40.0, 20.0], [30.0, np.nan]],
+        index=MultiIndex.from_tuples([(2, "a"), (1, "c"), (2, "c")], names=["x", "y"]),
+        columns=Index([9, 8], name="z"),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_sort_false_nan_in_unstacked_level_one_remaining_level():
+    # GH#62816 A single remaining level is enough to misplace values once the
+    #  unstacked level holds NaN: the sort indexer sized that level from its
+    #  length while renumbering its codes, so the NaN column collided with the
+    #  next row. Distinct mechanism from the >=2-remaining-levels case.
+    index = MultiIndex.from_tuples(
+        [("r0", np.nan), ("r1", np.nan), ("r0", "u0")], names=["r", "u"]
+    )
+    ser = Series([1.0, 2.0, 3.0], index=index)
+
+    result = ser.unstack(sort=False)
+
+    expected = DataFrame(
+        [[1.0, 3.0], [2.0, np.nan]],
+        index=Index(["r0", "r1"], name="r"),
+        columns=Index([np.nan, "u0"], name="u"),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_sort_false_does_not_collapse_rows():
+    # GH#62816 Distinct index combinations were merged into a single result
+    #  row, silently dropping data rather than only mislabelling it.
+    index = MultiIndex.from_tuples([(np.nan, np.nan, np.nan), ("a0", "b0", np.nan)])
+    ser = Series([1.0, 2.0], index=index)
+
+    result = ser.unstack(0, sort=False)
+
+    expected = DataFrame(
+        [[1.0, np.nan], [np.nan, 2.0]],
+        index=MultiIndex.from_tuples([(np.nan, np.nan), ("b0", np.nan)]),
+        columns=Index([np.nan, "a0"]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_multiple_sort_false_multiple_remaining_levels():
+    # GH#62816 _unstack_multiple routes through the same _Unstacker, so
+    #  unstacking several levels at once and leaving two or more behind hit
+    #  the same misplacement.
+    index = MultiIndex.from_tuples(
+        [(2, "a", 9, "p"), (1, "c", 9, "p"), (2, "c", 9, "p")],
+        names=["x", "y", "z", "w"],
+    )
+    ser = Series([10.0, 20.0, 30.0], index=index)
+
+    result = ser.unstack(["z", "w"], sort=False)
+
+    expected = DataFrame(
+        [[10.0], [20.0], [30.0]],
+        index=MultiIndex.from_tuples([(2, "a"), (1, "c"), (2, "c")], names=["x", "y"]),
+        columns=MultiIndex.from_tuples([(9, "p")], names=["z", "w"]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_unstack_monotonic_values_unsorted_codes():
+    # GH#65107 An MI whose tuple *values* are monotonic but whose codes are
+    #  unsorted (here level 0 has unsorted levels ['b', 'a']) must still be
+    #  reordered before reshaping.  Previously the identity-indexer fast path
+    #  keyed off index.is_monotonic_increasing, which reflects values not
+    #  codes, so it skipped the take and placed values under the wrong labels.
+    index = MultiIndex(levels=[["b", "a"], [1, 2]], codes=[[1, 1, 0, 0], [0, 1, 0, 1]])
+    # tuples are ("a", 1), ("a", 2), ("b", 1), ("b", 2)
+    ser = Series([10, 20, 30, 40], index=index)
+    result = ser.unstack()
+    expected = DataFrame(
+        {1: [30, 10], 2: [40, 20]},
+        index=Index(["b", "a"]),
+        columns=Index([1, 2]),
+    )
+    tm.assert_frame_equal(result, expected)
+    # ("a", 1) -> 10 must land under row "a", not row "b"
+    assert result.loc["a", 1] == 10
 
 
 def test_unstack_fill_frame_object():
@@ -1417,7 +1633,7 @@ def test_stack_timezone_aware_values(future_stack):
 @pytest.mark.parametrize("dropna", [True, False, lib.no_default])
 def test_stack_empty_frame(dropna, future_stack):
     # GH 36113
-    levels = [np.array([], dtype=np.int64), np.array([], dtype=np.int64)]
+    levels = [pd.RangeIndex(0), pd.RangeIndex(0)]
     expected = Series(dtype=np.float64, index=MultiIndex(levels=levels, codes=[[], []]))
     if future_stack and dropna is not lib.no_default:
         with pytest.raises(ValueError, match="dropna must be unspecified"):
@@ -1427,6 +1643,25 @@ def test_stack_empty_frame(dropna, future_stack):
             dropna=dropna, future_stack=future_stack
         )
         tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.filterwarnings("ignore:The previous implementation of stack is deprecated")
+@pytest.mark.parametrize("dropna", [True, False, lib.no_default])
+def test_stack_empty_level(dropna, future_stack, int_frame):
+    # GH 60740
+    if future_stack and dropna is not lib.no_default:
+        with pytest.raises(ValueError, match="dropna must be unspecified"):
+            DataFrame(dtype=np.int64).stack(dropna=dropna, future_stack=future_stack)
+    else:
+        expected = int_frame
+        result = int_frame.copy().stack(
+            level=[], dropna=dropna, future_stack=future_stack
+        )
+        tm.assert_frame_equal(result, expected)
+
+        expected = DataFrame()
+        result = DataFrame().stack(level=[], dropna=dropna, future_stack=future_stack)
+        tm.assert_frame_equal(result, expected)
 
 
 @pytest.mark.filterwarnings("ignore:The previous implementation of stack is deprecated")
@@ -1495,7 +1730,9 @@ def test_stack_positional_level_duplicate_column_names(future_stack):
     result = df.stack(0, future_stack=future_stack)
 
     new_columns = Index(["y", "z"], name="a")
-    new_index = MultiIndex.from_tuples([(0, "x"), (0, "y")], names=[None, "a"])
+    new_index = MultiIndex(
+        levels=[range(1), ["x", "y"]], codes=[[0, 0], [0, 1]], names=[None, "a"]
+    )
     expected = DataFrame([[1, 1], [1, 1]], index=new_index, columns=new_columns)
 
     tm.assert_frame_equal(result, expected)
@@ -1830,10 +2067,7 @@ class TestStackUnstackMultiLevel:
             }
         )
 
-        msg = "DataFrameGroupBy.apply operated on the grouping columns"
-        with tm.assert_produces_warning(DeprecationWarning, match=msg):
-            result = df.groupby(["state", "exp", "barcode", "v"]).apply(len)
-
+        result = df.groupby(["state", "exp", "barcode", "v"]).apply(len)
         unstacked = result.unstack()
         restacked = unstacked.stack(future_stack=future_stack)
         tm.assert_series_equal(restacked, result.reindex(restacked.index).astype(float))
@@ -1965,6 +2199,17 @@ class TestStackUnstackMultiLevel:
         with pytest.raises(IndexError, match="not a valid level number"):
             unstacked.stack([-4, -3], future_stack=future_stack)
 
+    @pytest.mark.parametrize("level", [[0, 0], ["l0", "l0"], [2, -1], [1, -2]])
+    def test_stack_duplicate_levels(self, level):
+        # GH#66588
+        columns = MultiIndex.from_product(
+            [["A", "B"], ["c", "d"], ["e", "f"]], names=["l0", "l1", "l2"]
+        )
+        df = DataFrame(np.arange(8).reshape(1, 8), columns=columns)
+
+        with pytest.raises(ValueError, match="level should not contain duplicate"):
+            df.stack(level)
+
     def test_unstack_period_series(self):
         # GH4342
         idx1 = pd.PeriodIndex(
@@ -2084,7 +2329,7 @@ class TestStackUnstackMultiLevel:
     @pytest.mark.filterwarnings(
         "ignore:The previous implementation of stack is deprecated"
     )
-    def test_stack_multiple_bug(self, future_stack):
+    def test_stack_multiple_bug(self, future_stack, using_infer_string):
         # bug when some uniques are not present in the data GH#3170
         id_col = ([1] * 3) + ([2] * 3)
         name = (["a"] * 3) + (["b"] * 3)
@@ -2096,6 +2341,8 @@ class TestStackUnstackMultiLevel:
         multi.columns.name = "Params"
         unst = multi.unstack("ID")
         msg = re.escape("agg function failed [how->mean,dtype->")
+        if using_infer_string:
+            msg = "dtype 'str' does not support operation 'mean'"
         with pytest.raises(TypeError, match=msg):
             unst.resample("W-THU").mean()
         down = unst.resample("W-THU").mean(numeric_only=True)
@@ -2184,7 +2431,7 @@ class TestStackUnstackMultiLevel:
         tm.assert_frame_equal(recons, df)
 
     @pytest.mark.slow
-    def test_unstack_number_of_levels_larger_than_int32(
+    def test_unstack_number_of_levels_larger_than_int32_warns(
         self, performance_warning, monkeypatch
     ):
         # GH#20601
@@ -2195,6 +2442,9 @@ class TestStackUnstackMultiLevel:
                 # __init__ will raise the warning
                 super().__init__(*args, **kwargs)
                 raise Exception("Don't compute final result.")
+
+            def _make_selectors(self) -> None:
+                pass
 
         with monkeypatch.context() as m:
             m.setattr(reshape_lib, "_Unstacker", MockUnstacker)
@@ -2212,9 +2462,11 @@ class TestStackUnstackMultiLevel:
     )
     @pytest.mark.parametrize(
         "levels",
-        itertools.chain.from_iterable(
-            itertools.product(itertools.permutations([0, 1, 2], width), repeat=2)
-            for width in [2, 3]
+        list(
+            itertools.chain.from_iterable(
+                itertools.product(itertools.permutations([0, 1, 2], width), repeat=2)
+                for width in [2, 3]
+            )
         ),
     )
     @pytest.mark.parametrize("stack_lev", range(2))
@@ -2303,7 +2555,7 @@ class TestStackUnstackMultiLevel:
         )
         expected = DataFrame(
             [["a0", "b0"], ["a1", "b1"], ["a2", "b2"], ["a3", "b3"], ["a4", "b4"]],
-            index=[0, 1, 2, 3, 4],
+            index=range(5),
             columns=MultiIndex.from_tuples(
                 [("a", "x"), ("b", "x")], names=["first", "second"]
             ),
@@ -2505,7 +2757,7 @@ class TestStackUnstackMultiLevel:
                     ]
                 ),
             )
-        tm.assert_frame_equal(result, expected)
+        tm.assert_frame_equal(result, expected, check_index_type=False)
 
     @pytest.mark.filterwarnings(
         "ignore:The previous implementation of stack is deprecated"
@@ -2642,7 +2894,7 @@ def test_stack_tuple_columns(future_stack):
     expected = Series(
         [1, 2, 3, 4, 5, 6, 7, 8, 9],
         index=MultiIndex(
-            levels=[[0, 1, 2], [("a", 1), ("a", 2), ("b", 1)]],
+            levels=[range(3), [("a", 1), ("a", 2), ("b", 1)]],
             codes=[[0, 0, 0, 1, 1, 1, 2, 2, 2], [0, 1, 2, 0, 1, 2, 0, 1, 2]],
         ),
     )

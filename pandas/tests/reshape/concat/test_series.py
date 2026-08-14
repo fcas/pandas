@@ -3,7 +3,6 @@ import pytest
 
 from pandas import (
     DataFrame,
-    DatetimeIndex,
     Index,
     MultiIndex,
     Series,
@@ -14,10 +13,22 @@ import pandas._testing as tm
 
 
 class TestSeriesConcat:
+    @pytest.mark.parametrize("bool_dtype", [bool, "boolean"])
+    @pytest.mark.parametrize("dtype", [np.int64, np.float64, "Int64", "Float64"])
+    def test_concat_bool_and_numeric(self, bool_dtype, dtype):
+        # GH#21108, GH#45101
+        left = Series([True, False], dtype=bool_dtype)
+        right = Series([1, 2], dtype=dtype)
+        result = concat([left, right], ignore_index=True)
+        expected = Series([True, False, 1, 2], dtype=object)
+        assert result.iloc[0] is True
+        assert type(result.iloc[2]) in [int, float]  # i.e. not bool
+        tm.assert_series_equal(result, expected)
+
     def test_concat_series(self):
         ts = Series(
             np.arange(20, dtype=np.float64),
-            index=date_range("2020-01-01", periods=20),
+            index=date_range("2020-01-01", periods=20, unit="ns"),
             name="foo",
         )
         ts.name = "foo"
@@ -32,7 +43,7 @@ class TestSeriesConcat:
         expected = ts.copy()
         exp_codes = [np.repeat([0, 1, 2], [len(x) for x in pieces]), np.arange(len(ts))]
         exp_index = MultiIndex(
-            levels=[[0, 1, 2], DatetimeIndex(ts.index.to_numpy(dtype="M8[ns]"))],
+            levels=[[0, 1, 2], ts.index],
             codes=exp_codes,
         )
         expected.index = exp_index

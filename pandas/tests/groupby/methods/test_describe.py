@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from pandas.errors import Pandas4Warning
+
 import pandas as pd
 from pandas import (
     DataFrame,
@@ -79,7 +81,7 @@ def test_frame_describe_multikey(tsframe):
         group = grouped[col].describe()
         # GH 17464 - Remove duplicate MultiIndex levels
         group_col = MultiIndex(
-            levels=[[col], group.columns],
+            levels=[Index([col], dtype=tsframe.columns.dtype), group.columns],
             codes=[[0] * len(group.columns), range(len(group.columns))],
         )
         group = DataFrame(group.values, columns=group_col, index=group.index)
@@ -202,15 +204,15 @@ def test_describe_duplicate_columns():
     gb = df.groupby(df[1])
     result = gb.describe(percentiles=[])
 
-    columns = ["count", "mean", "std", "min", "50%", "max"]
+    columns = ["count", "mean", "std", "min", "max"]
     frames = [
-        DataFrame([[1.0, val, np.nan, val, val, val]], index=[1], columns=columns)
+        DataFrame([[1.0, val, np.nan, val, val]], index=[1], columns=columns)
         for val in (0.0, 2.0, 3.0)
     ]
     expected = pd.concat(frames, axis=1)
     expected.columns = MultiIndex(
         levels=[[0, 2], columns],
-        codes=[6 * [0] + 6 * [1] + 6 * [0], 3 * list(range(6))],
+        codes=[5 * [0] + 5 * [1] + 5 * [0], 3 * list(range(5))],
     )
     expected.index.names = [1]
     tm.assert_frame_equal(result, expected)
@@ -265,7 +267,11 @@ def test_groupby_empty_dataset(dtype, kwargs):
     expected = df.groupby("A").describe(**kwargs).reset_index(drop=True).iloc[:0]
     tm.assert_frame_equal(result, expected)
 
-    result = df.iloc[:0].groupby("A").B.describe(**kwargs)
-    expected = df.groupby("A").B.describe(**kwargs).reset_index(drop=True).iloc[:0]
-    expected.index = Index([])
+    # GH#54193: include/exclude on Series.describe is deprecated
+    msg = "'include' and 'exclude' arguments are deprecated for Series.describe"
+    with tm.assert_produces_warning(Pandas4Warning, match=msg):
+        result = df.iloc[:0].groupby("A").B.describe(**kwargs)
+    with tm.assert_produces_warning(Pandas4Warning, match=msg):
+        expected = df.groupby("A").B.describe(**kwargs).reset_index(drop=True).iloc[:0]
+    expected.index = Index([], dtype=df.columns.dtype)
     tm.assert_frame_equal(result, expected)

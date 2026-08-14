@@ -1,3 +1,4 @@
+from collections import namedtuple
 from datetime import timedelta
 import re
 
@@ -14,6 +15,7 @@ from pandas import (
     Index,
     MultiIndex,
     date_range,
+    period_range,
 )
 import pandas._testing as tm
 
@@ -92,7 +94,7 @@ class TestSliceLocs:
                 np.array([1, 0, 1, 1, 0, 0, 1, 0]),
             ],
         )
-        msg = "[Kk]ey length.*greater than MultiIndex lexsort depth"
+        msg = "Key length.*was greater than MultiIndex lexsort depth"
         with pytest.raises(KeyError, match=msg):
             index.slice_locs((1, 0, 1), (2, 1, 0))
 
@@ -258,8 +260,7 @@ class TestGetIndexer:
     def test_get_indexer_nearest(self):
         midx = MultiIndex.from_tuples([("a", 1), ("b", 2)])
         msg = (
-            "method='nearest' not implemented yet for MultiIndex; "
-            "see GitHub issue 9365"
+            "method='nearest' not implemented yet for MultiIndex; see GitHub issue 9365"
         )
         with pytest.raises(NotImplementedError, match=msg):
             midx.get_indexer(["a"], method="nearest")
@@ -777,6 +778,25 @@ class TestGetLoc:
         with pytest.raises(KeyError, match=re.escape(str(key))):
             mi.get_loc(key)
 
+    def test_get_loc_string_key_on_numeric_level(self):
+        # GH#60104 - string key on integer level should raise KeyError,
+        # not return wrong results due to numpy searchsorted cross-dtype bug
+        mi = MultiIndex.from_product([[2000, 2001], ["a", "b"], ["x", "y"]])
+        df = DataFrame({"value": range(8)}, index=mi)
+
+        with pytest.raises(KeyError, match="2000"):
+            df.loc[("2000",)]
+        with pytest.raises(KeyError, match="a"):
+            df.loc[("2000", "a")]
+        with pytest.raises(KeyError, match="GIBBERISH"):
+            df.loc[("2000", "GIBBERISH")]
+
+        # Valid lookups should still work
+        result = df.loc[(2000, "a")]
+        assert len(result) == 2
+        result = df.loc[(2000,)]
+        assert len(result) == 4
+
 
 class TestWhere:
     def test_where(self):
@@ -962,7 +982,7 @@ def test_pyint_engine(N, expected_dtype):
 
     # With missing key:
     idces = range(len(keys))
-    expected = np.array([-1] + list(idces), dtype=np.intp)
+    expected = np.array([-1, *list(idces)], dtype=np.intp)
     missing = tuple([0, 1, 0, 1] * N)
     result = index.get_indexer([missing] + [keys[i] for i in idces])
     tm.assert_numpy_array_equal(result, expected)
@@ -994,6 +1014,72 @@ def test_get_locs_reordering(keys, expected):
     tm.assert_numpy_array_equal(result, expected)
 
 
+def test_get_locs_list_like_basic():
+    # GH#55786 - vectorized path for list-like keys
+    idx = MultiIndex.from_product([["a", "b"], [1, 2, 3]])
+    result = idx.get_locs((["a"], [1, 3]))
+    expected = np.array([0, 2], dtype=np.intp)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_locs_list_like_with_nan():
+    # GH#55786 - NaN labels are stored as code -1
+    idx = MultiIndex.from_arrays([["a", "a", "b"], [1.0, np.nan, 2.0]])
+    result = idx.get_locs((["a"], [np.nan]))
+    expected = np.array([1], dtype=np.intp)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_locs_list_like_with_nan_and_valid():
+    # GH#55786 - mix of NaN and valid labels
+    idx = MultiIndex.from_arrays([["a", "a", "a"], [1.0, np.nan, 2.0]])
+    result = idx.get_locs((slice(None), [1.0, np.nan]))
+    expected = np.array([0, 1], dtype=np.intp)
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_locs_list_like_missing_raises():
+    # GH#55786 - missing labels raise KeyError
+    idx = MultiIndex.from_product([["a", "b"], [1, 2]])
+    with pytest.raises(KeyError, match="99"):
+        idx.get_locs((["a"], [1, 99]))
+
+
+def test_get_locs_list_like_nan_not_in_level():
+    # GH#55786 - NaN in query but not in index raises KeyError
+    idx = MultiIndex.from_product([["a"], [1, 2]])
+    with pytest.raises(KeyError, match="nan"):
+        idx.get_locs((["a"], [np.nan]))
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        date_range("2020-01-01", "2020-03-31", freq="D"),
+        period_range("2020-01-01", "2020-03-31", freq="D"),
+    ],
+)
+@pytest.mark.parametrize("keys", [["2020-02"], ["2020-02", "2020-03"]])
+def test_get_locs_list_like_partial_string(level, keys):
+    # GH#64807 - a list-like of partial-string keys on a level that supports
+    #  partial indexing (Datetime/Period) must match the same rows as the
+    #  scalar key, not just the exact-coerced timestamp.
+    idx = MultiIndex.from_product([level, ["a", "b"]])
+
+    result = idx.get_locs([keys])
+    expected = np.concatenate([idx.get_locs([key]) for key in keys])
+    expected.sort()
+    tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_locs_list_like_partial_string_missing_raises():
+    # GH#64807 - a partial-string key absent from the level still raises KeyError
+    level = date_range("2020-01-01", "2020-03-31", freq="D")
+    idx = MultiIndex.from_product([level, ["a", "b"]])
+    with pytest.raises(KeyError, match="2021-01"):
+        idx.get_locs([["2021-01"]])
+
+
 def test_get_indexer_for_multiindex_with_nans(nulls_fixture):
     # GH37222
     idx1 = MultiIndex.from_product([["A"], [1.0, 2.0]], names=["id1", "id2"])
@@ -1006,3 +1092,26 @@ def test_get_indexer_for_multiindex_with_nans(nulls_fixture):
     result = idx1.get_indexer(idx2)
     expected = np.array([-1, 1], dtype=np.intp)
     tm.assert_numpy_array_equal(result, expected)
+
+
+def test_get_loc_namedtuple_behaves_like_tuple():
+    # GH57922
+    NamedIndex = namedtuple("NamedIndex", ("a", "b"))
+    multi_idx = MultiIndex.from_tuples(
+        [NamedIndex("i1", "i2"), NamedIndex("i3", "i4"), NamedIndex("i5", "i6")]
+    )
+    for idx in (multi_idx, multi_idx.to_flat_index()):
+        assert idx.get_loc(NamedIndex("i1", "i2")) == 0
+        assert idx.get_loc(NamedIndex("i3", "i4")) == 1
+        assert idx.get_loc(NamedIndex("i5", "i6")) == 2
+        assert idx.get_loc(("i1", "i2")) == 0
+        assert idx.get_loc(("i3", "i4")) == 1
+        assert idx.get_loc(("i5", "i6")) == 2
+    multi_idx = MultiIndex.from_tuples([("i1", "i2"), ("i3", "i4"), ("i5", "i6")])
+    for idx in (multi_idx, multi_idx.to_flat_index()):
+        assert idx.get_loc(NamedIndex("i1", "i2")) == 0
+        assert idx.get_loc(NamedIndex("i3", "i4")) == 1
+        assert idx.get_loc(NamedIndex("i5", "i6")) == 2
+        assert idx.get_loc(("i1", "i2")) == 0
+        assert idx.get_loc(("i3", "i4")) == 1
+        assert idx.get_loc(("i5", "i6")) == 2

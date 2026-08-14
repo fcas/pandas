@@ -3,16 +3,20 @@ Tests that work on both the Python and C engines but do not have a
 specific classification into the other test modules.
 """
 
+import csv
 from datetime import datetime
 from inspect import signature
 from io import StringIO
 import os
-from pathlib import Path
 import sys
 
 import numpy as np
 import pytest
 
+from pandas._config import using_string_dtype
+
+from pandas._libs import parsers as libparsers
+from pandas.compat import HAS_PYARROW
 from pandas.errors import (
     EmptyDataError,
     ParserError,
@@ -40,9 +44,7 @@ def test_read_csv_local(all_parsers, csv1):
 
     fname = prefix + str(os.path.abspath(csv1))
     result = parser.read_csv(fname, index_col=0, parse_dates=True)
-    # TODO: make unit check more specific
-    if parser.engine == "pyarrow":
-        result.index = result.index.as_unit("ns")
+
     expected = DataFrame(
         [
             [0.980269, 3.685731, -0.364216805298, -1.159738],
@@ -64,31 +66,66 @@ def test_read_csv_local(all_parsers, csv1):
                 datetime(2000, 1, 10),
                 datetime(2000, 1, 11),
             ],
+            dtype="M8[us]",
             name="index",
         ),
     )
+    if parser.engine == "pyarrow":
+        expected.index = expected.index.astype("M8[s]")
     tm.assert_frame_equal(result, expected)
 
 
-def test_1000_sep(all_parsers):
+@pytest.mark.parametrize(
+    "number_csv, expected_number",
+    [
+        ("2,334", 2334),
+        ("-2,334", -2334),
+        ("-2,334,", -2334),
+        # Multiple consecutive thousand separators are allowed in C engine,
+        # but it's not necessarily intended behavior and may change in the future.
+        ("2,,,,,,,,,,,,,,,5", 25),
+        ("2,,3,4,,,,,,,,,,,,5", 2345),
+    ],
+)
+def test_1000_sep(all_parsers, number_csv, expected_number, request):
     parser = all_parsers
-    data = """A|B|C
-1|2,334|5
+    data = f"""A|B|C
+1|{number_csv}|5
 10|13|10.
 """
-    expected = DataFrame({"A": [1, 10], "B": [2334, 13], "C": [5, 10.0]})
+    expected = DataFrame({"A": [1, 10], "B": [expected_number, 13], "C": [5, 10.0]})
 
     if parser.engine == "pyarrow":
         msg = "The 'thousands' option is not supported with the 'pyarrow' engine"
         with pytest.raises(ValueError, match=msg):
             parser.read_csv(StringIO(data), sep="|", thousands=",")
         return
+    elif parser.engine == "python" and ",," in number_csv:
+        mark = pytest.mark.xfail(
+            reason="Python engine doesn't allow consecutive thousands separators"
+        )
+        request.applymarker(mark)
 
     result = parser.read_csv(StringIO(data), sep="|", thousands=",")
     tm.assert_frame_equal(result, expected)
 
 
-@xfail_pyarrow  # ValueError: Found non-unique column index
+@pytest.mark.parametrize("value", ["1 ,", ", 1", ",1"])
+def test_1000_sep_not_stripped_after_whitespace(all_parsers, value):
+    parser = all_parsers
+    data = f"a\n{value}\n"
+    expected = DataFrame({"a": [value]})
+
+    if parser.engine == "pyarrow":
+        msg = "The 'thousands' option is not supported with the 'pyarrow' engine"
+        with pytest.raises(ValueError, match=msg):
+            parser.read_csv(StringIO(data), sep=";", thousands=",")
+        return
+
+    result = parser.read_csv(StringIO(data), sep=";", thousands=",")
+    tm.assert_frame_equal(result, expected)
+
+
 def test_unnamed_columns(all_parsers):
     data = """A,B,C,,
 1,2,3,4,5
@@ -144,9 +181,6 @@ def test_read_csv_low_memory_no_rows_with_index(all_parsers):
 def test_read_csv_dataframe(all_parsers, csv1):
     parser = all_parsers
     result = parser.read_csv(csv1, index_col=0, parse_dates=True)
-    # TODO: make unit check more specific
-    if parser.engine == "pyarrow":
-        result.index = result.index.as_unit("ns")
     expected = DataFrame(
         [
             [0.980269, 3.685731, -0.364216805298, -1.159738],
@@ -168,9 +202,12 @@ def test_read_csv_dataframe(all_parsers, csv1):
                 datetime(2000, 1, 10),
                 datetime(2000, 1, 11),
             ],
+            dtype="M8[us]",
             name="index",
         ),
     )
+    if parser.engine == "pyarrow":
+        expected.index = expected.index.astype("M8[s]")
     tm.assert_frame_equal(result, expected)
 
 
@@ -349,13 +386,47 @@ def test_escapechar(all_parsers):
     tm.assert_index_equal(result.columns, Index(["SEARCH_TERM", "ACTUAL_URL"]))
 
 
+@skip_pyarrow
+def test_escapechar_quoting_round_trip(all_parsers):
+    # GH#25501 - round-trip with escapechar before quotechar
+    parser = all_parsers
+    escape = "\\"
+    quote = '"'
+    sep = "|"
+
+    sample_data = [i * escape + quote for i in range(1, 11)]
+    initial_df = DataFrame(sample_data, columns=["column"])
+
+    csv_text = initial_df.to_csv(
+        sep=sep,
+        columns=None,
+        header=None,
+        index=False,
+        doublequote=False,
+        quoting=csv.QUOTE_ALL,
+        quotechar=quote,
+        escapechar=escape,
+    )
+
+    result = parser.read_csv(
+        StringIO(csv_text),
+        sep=sep,
+        escapechar=escape,
+        quoting=csv.QUOTE_ALL,
+        header=None,
+        doublequote=False,
+    )
+    expected = DataFrame(sample_data)
+    tm.assert_frame_equal(result, expected)
+
+
 def test_ignore_leading_whitespace(all_parsers):
     # see gh-3374, gh-6607
     parser = all_parsers
     data = " a b c\n 1 2 3\n 4 5 6\n 7 8 9"
 
     if parser.engine == "pyarrow":
-        msg = "the 'pyarrow' engine does not support regex separators"
+        msg = "the 'pyarrow' engine does not support separators > 1 char"
         with pytest.raises(ValueError, match=msg):
             parser.read_csv(StringIO(data), sep=r"\s+")
         return
@@ -525,7 +596,7 @@ A,B,C
         data = data.replace(",", "  ")
 
         if parser.engine == "pyarrow":
-            msg = "the 'pyarrow' engine does not support regex separators"
+            msg = "the 'pyarrow' engine does not support separators > 1 char"
             with pytest.raises(ValueError, match=msg):
                 parser.read_csv(
                     StringIO(data), sep=sep, skip_blank_lines=skip_blank_lines
@@ -578,7 +649,7 @@ def test_whitespace_regex_separator(all_parsers, data, expected):
     # see gh-6607
     parser = all_parsers
     if parser.engine == "pyarrow":
-        msg = "the 'pyarrow' engine does not support regex separators"
+        msg = "the 'pyarrow' engine does not support separators > 1 char"
         with pytest.raises(ValueError, match=msg):
             parser.read_csv(StringIO(data), sep=r"\s+")
         return
@@ -587,9 +658,9 @@ def test_whitespace_regex_separator(all_parsers, data, expected):
     tm.assert_frame_equal(result, expected)
 
 
-def test_sub_character(all_parsers, csv_dir_path):
+def test_sub_character(all_parsers, datapath):
     # see gh-16893
-    filename = os.path.join(csv_dir_path, "sub_char.csv")
+    filename = datapath("io", "parser", "data", "sub_char.csv")
     expected = DataFrame([[1, 2, 3]], columns=["a", "\x1ab", "c"])
 
     parser = all_parsers
@@ -598,16 +669,16 @@ def test_sub_character(all_parsers, csv_dir_path):
 
 
 @pytest.mark.parametrize("filename", ["sé-es-vé.csv", "ru-sй.csv", "中文文件名.csv"])
-def test_filename_with_special_chars(all_parsers, filename):
+def test_filename_with_special_chars(all_parsers, filename, tmp_path):
     # see gh-15086.
     parser = all_parsers
     df = DataFrame({"a": [1, 2, 3]})
 
-    with tm.ensure_clean(filename) as path:
-        df.to_csv(path, index=False)
+    path = tmp_path / filename
+    df.to_csv(path, index=False)
 
-        result = parser.read_csv(path)
-        tm.assert_frame_equal(result, df)
+    result = parser.read_csv(path)
+    tm.assert_frame_equal(result, df)
 
 
 def test_read_table_same_signature_as_read_csv(all_parsers):
@@ -767,8 +838,9 @@ def test_dict_keys_as_names(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
+@pytest.mark.xfail(using_string_dtype() and HAS_PYARROW, reason="TODO(infer_string)")
 @xfail_pyarrow  # UnicodeDecodeError: 'utf-8' codec can't decode byte 0xed in position 0
-def test_encoding_surrogatepass(all_parsers):
+def test_encoding_surrogatepass(all_parsers, tmp_path):
     # GH39017
     parser = all_parsers
     content = b"\xed\xbd\xbf"
@@ -776,14 +848,14 @@ def test_encoding_surrogatepass(all_parsers):
     expected = DataFrame({decoded: [decoded]}, index=[decoded * 2])
     expected.index.name = decoded * 2
 
-    with tm.ensure_clean() as path:
-        Path(path).write_bytes(
-            content * 2 + b"," + content + b"\n" + content * 2 + b"," + content
-        )
-        df = parser.read_csv(path, encoding_errors="surrogatepass", index_col=0)
-        tm.assert_frame_equal(df, expected)
-        with pytest.raises(UnicodeDecodeError, match="'utf-8' codec can't decode byte"):
-            parser.read_csv(path)
+    path = tmp_path / "test_encoding.csv"
+    path.write_bytes(
+        content * 2 + b"," + content + b"\n" + content * 2 + b"," + content
+    )
+    df = parser.read_csv(path, encoding_errors="surrogatepass", index_col=0)
+    tm.assert_frame_equal(df, expected)
+    with pytest.raises(UnicodeDecodeError, match="'utf-8' codec can't decode byte"):
+        parser.read_csv(path)
 
 
 def test_malformed_second_line(all_parsers):
@@ -817,15 +889,27 @@ def test_short_multi_line(all_parsers):
     tm.assert_frame_equal(result, expected)
 
 
-def test_read_seek(all_parsers):
+def test_read_seek(all_parsers, tmp_path):
     # GH48646
     parser = all_parsers
     prefix = "### DATA\n"
     content = "nkey,value\ntables,rectangular\n"
-    with tm.ensure_clean() as path:
-        Path(path).write_text(prefix + content, encoding="utf-8")
-        with open(path, encoding="utf-8") as file:
-            file.readline()
-            actual = parser.read_csv(file)
-        expected = parser.read_csv(StringIO(content))
+    path = tmp_path / "test_seek.csv"
+    path.write_text(prefix + content, encoding="utf-8")
+    with open(path, encoding="utf-8") as file:
+        file.readline()
+        actual = parser.read_csv(file)
+    expected = parser.read_csv(StringIO(content))
     tm.assert_frame_equal(actual, expected)
+
+
+def test_dtype_conversion_in_sanitization():
+    # GH60088
+    values = np.array([1, True, 0, False, 1.0, 0.0, np.True_, np.False_], dtype=object)
+    expected = np.array(
+        [1, True, 0, False, 1.0, 0.0, np.True_, np.False_], dtype=object
+    )
+    libparsers.sanitize_objects(values, na_values=set())
+    for v, e in zip(values, expected, strict=True):
+        assert v == e
+        assert type(v) == type(e)

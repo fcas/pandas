@@ -1,13 +1,18 @@
 import re
+import warnings
 import weakref
 
 import numpy as np
 import pytest
-import pytz
 
 from pandas._libs.tslibs.dtypes import NpyDatetimeUnit
+from pandas.errors import Pandas4Warning
 
-from pandas.core.dtypes.base import _registry as registry
+from pandas.core.dtypes.base import (
+    ExtensionDtype,
+    _registry as registry,
+    register_extension_dtype,
+)
 from pandas.core.dtypes.common import (
     is_bool_dtype,
     is_categorical_dtype,
@@ -61,7 +66,7 @@ class Base:
         assert not dtype == np.str_
         assert not np.str_ == dtype
 
-    def test_pickle(self, dtype):
+    def test_pickle(self, dtype, temp_file):
         # make sure our cache is NOT pickled
 
         # clear the cache
@@ -69,7 +74,7 @@ class Base:
         assert not len(dtype._cache_dtypes)
 
         # force back to the cache
-        result = tm.round_trip_pickle(dtype)
+        result = tm.round_trip_pickle(dtype, temp_file)
         if not isinstance(dtype, PeriodDtype):
             # Because PeriodDtype has a cython class as a base class,
             #  it has different pickle semantics, and its cache is re-populated
@@ -122,7 +127,9 @@ class TestCategoricalDtype(Base):
 
     dtype1 = CategoricalDtype(["a", "b"], ordered=True)
     dtype2 = CategoricalDtype(["x", "y"], ordered=False)
-    c = Categorical([0, 1], dtype=dtype1)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        c = Categorical([0, 1], dtype=dtype1)
 
     @pytest.mark.parametrize(
         "values, categories, ordered, dtype, expected",
@@ -153,7 +160,7 @@ class TestCategoricalDtype(Base):
             CategoricalDtype._from_values_or_dtype(values, categories, ordered, dtype)
 
     def test_from_values_or_dtype_invalid_dtype(self):
-        msg = "Cannot not construct CategoricalDtype from <class 'object'>"
+        msg = "Cannot construct CategoricalDtype from <class 'object'>"
         with pytest.raises(ValueError, match=msg):
             CategoricalDtype._from_values_or_dtype(None, None, None, object)
 
@@ -166,7 +173,7 @@ class TestCategoricalDtype(Base):
 
     def test_basic(self, dtype):
         msg = "is_categorical_dtype is deprecated"
-        with tm.assert_produces_warning(DeprecationWarning, match=msg):
+        with tm.assert_produces_warning(Pandas4Warning, match=msg):
             assert is_categorical_dtype(dtype)
 
             factor = Categorical(["a", "b", "b", "a", "a", "c", "c", "c"])
@@ -250,10 +257,14 @@ class TestDatetimeTZDtype(Base):
 
     def test_alias_to_unit_bad_alias_raises(self):
         # 23990
-        with pytest.raises(TypeError, match=""):
+        with pytest.raises(
+            TypeError, match="Cannot construct a 'DatetimeTZDtype' from"
+        ):
             DatetimeTZDtype("this is a bad string")
 
-        with pytest.raises(TypeError, match=""):
+        with pytest.raises(
+            TypeError, match="Cannot construct a 'DatetimeTZDtype' from"
+        ):
             DatetimeTZDtype("datetime64[ns, US/NotATZ]")
 
     def test_hash_vs_equality(self, dtype):
@@ -287,12 +298,11 @@ class TestDatetimeTZDtype(Base):
         a = DatetimeTZDtype.construct_from_string("datetime64[ns, US/Eastern]")
         b = DatetimeTZDtype.construct_from_string("datetime64[ns, CET]")
 
-        assert issubclass(type(a), type(a))
         assert issubclass(type(a), type(b))
 
     def test_compat(self, dtype):
         msg = "is_datetime64tz_dtype is deprecated"
-        with tm.assert_produces_warning(DeprecationWarning, match=msg):
+        with tm.assert_produces_warning(Pandas4Warning, match=msg):
             assert is_datetime64tz_dtype(dtype)
             assert is_datetime64tz_dtype("datetime64[ns, US/Eastern]")
         assert is_datetime64_any_dtype(dtype)
@@ -391,8 +401,9 @@ class TestDatetimeTZDtype(Base):
 
     def test_tz_standardize(self):
         # GH 24713
+        pytz = pytest.importorskip("pytz")
         tz = pytz.timezone("US/Eastern")
-        dr = date_range("2013-01-01", periods=3, tz="US/Eastern")
+        dr = date_range("2013-01-01", periods=3, tz=tz)
         dtype = DatetimeTZDtype("ns", dr.tz)
         assert dtype.tz == tz
         dtype = DatetimeTZDtype("ns", dr[0].tz)
@@ -458,7 +469,6 @@ class TestPeriodDtype(Base):
         a = PeriodDtype("period[D]")
         b = PeriodDtype("period[3D]")
 
-        assert issubclass(type(a), type(a))
         assert issubclass(type(a), type(b))
 
     def test_identity(self):
@@ -660,8 +670,7 @@ class TestIntervalDtype(Base):
     def test_construction_not_supported(self, subtype):
         # GH 19016
         msg = (
-            "category, object, and string subtypes are not supported "
-            "for IntervalDtype"
+            "category, object, and string subtypes are not supported for IntervalDtype"
         )
         with pytest.raises(TypeError, match=msg):
             IntervalDtype(subtype)
@@ -714,7 +723,6 @@ class TestIntervalDtype(Base):
         a = IntervalDtype("interval[int64, right]")
         b = IntervalDtype("interval[int64, right]")
 
-        assert issubclass(type(a), type(a))
         assert issubclass(type(a), type(b))
 
     def test_is_dtype(self, dtype):
@@ -844,7 +852,7 @@ class TestIntervalDtype(Base):
             assert not is_interval_dtype(np.int64)
             assert not is_interval_dtype(np.float64)
 
-    def test_caching(self):
+    def test_caching(self, temp_file):
         # GH 54184: Caching not shown to improve performance
         IntervalDtype.reset_cache()
         dtype = IntervalDtype("int64", "right")
@@ -854,20 +862,20 @@ class TestIntervalDtype(Base):
         assert len(IntervalDtype._cache_dtypes) == 0
 
         IntervalDtype.reset_cache()
-        tm.round_trip_pickle(dtype)
+        tm.round_trip_pickle(dtype, temp_file)
         assert len(IntervalDtype._cache_dtypes) == 0
 
     def test_not_string(self):
         # GH30568: though IntervalDtype has object kind, it cannot be string
         assert not is_string_dtype(IntervalDtype())
 
-    def test_unpickling_without_closed(self):
+    def test_unpickling_without_closed(self, temp_file):
         # GH#38394
         dtype = IntervalDtype("interval")
 
         assert dtype._closed is None
 
-        tm.round_trip_pickle(dtype)
+        tm.round_trip_pickle(dtype, temp_file)
 
     def test_dont_keep_ref_after_del(self):
         # GH 54184
@@ -1057,8 +1065,7 @@ class TestCategoricalDtypeParametrized:
     def test_str_vs_repr(self, ordered, using_infer_string):
         c1 = CategoricalDtype(["a", "b"], ordered=ordered)
         assert str(c1) == "category"
-        # Py2 will have unicode prefixes
-        dtype = "string" if using_infer_string else "object"
+        dtype = "str" if using_infer_string else "object"
         pat = (
             r"CategoricalDtype\(categories=\[.*\], ordered={ordered}, "
             rf"categories_dtype={dtype}\)"
@@ -1125,6 +1132,29 @@ def test_registry(dtype):
 )
 def test_registry_find(dtype, expected):
     assert registry.find(dtype) == expected
+
+
+def test_construct_from_string_no_name_gh46093():
+    # GH#46093
+    class FooType(ExtensionDtype):
+        pass
+
+    msg = (
+        "Cannot construct a 'FooType' from a string because it does not define "
+        "a string 'name' attribute"
+    )
+    with pytest.raises(TypeError, match=msg):
+        FooType.construct_from_string("foo")
+
+
+def test_register_extension_dtype_no_name_gh46093():
+    # GH#46093 registration fails fast rather than erroring later on use
+    msg = "Cannot register 'NamelessType' because it does not define a string"
+    with pytest.raises(TypeError, match=msg):
+
+        @register_extension_dtype
+        class NamelessType(ExtensionDtype):
+            pass
 
 
 @pytest.mark.parametrize(
@@ -1230,4 +1260,25 @@ def test_multi_column_dtype_assignment():
     tm.assert_frame_equal(df, expected)
 
     df["b"] = 0
+    tm.assert_frame_equal(df, expected)
+
+
+def test_loc_setitem_empty_labels_no_dtype_conversion():
+    # GH 29707
+
+    df = pd.DataFrame({"a": [2, 3]})
+    expected = df.copy()
+    assert df.a.dtype == "int64"
+    df.loc[[]] = 0.1
+
+    assert df.a.dtype == "int64"
+    tm.assert_frame_equal(df, expected)
+
+
+def test_categorical_nan_no_dtype_conversion():
+    # GH 43996
+
+    df = pd.DataFrame({"a": Categorical([np.nan], [1]), "b": [1]})
+    expected = pd.DataFrame({"a": Categorical([1], [1]), "b": [1]})
+    df.loc[0, "a"] = np.array([1])
     tm.assert_frame_equal(df, expected)

@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from datetime import datetime
 from decimal import Decimal
 
@@ -7,7 +6,6 @@ import pytest
 
 from pandas._libs import missing as libmissing
 from pandas._libs.tslibs import iNaT
-from pandas.compat.numpy import np_version_gte1p25
 
 from pandas.core.dtypes.common import (
     is_float,
@@ -162,8 +160,8 @@ class TestIsNA:
         arr = np.array(
             [
                 NaT,
-                np.datetime64("NaT"),
-                np.timedelta64("NaT"),
+                np.datetime64("NaT", "ns"),
+                np.timedelta64("NaT", "ns"),
                 np.datetime64("NaT", "s"),
             ]
         )
@@ -323,7 +321,7 @@ class TestIsNA:
 
     def test_decimal(self):
         # scalars GH#23530
-        a = Decimal(1.0)
+        a = Decimal("1.0")
         assert isna(a) is False
         assert notna(a) is True
 
@@ -407,6 +405,62 @@ def test_array_equivalent(dtype_equal):
 
 
 @pytest.mark.parametrize("dtype_equal", [True, False])
+@pytest.mark.parametrize("dtype", ["float16", ">f8", ">f4", ">c16", ">c8"])
+def test_array_equivalent_nonnative_or_float16(dtype, dtype_equal):
+    # GH#65192 the fastpath Cython helper only accepts native float32/float64:
+    # float16/byte-swapped floats raised, non-native complex gave wrong results.
+    left = np.array([1.0, 2.0, np.nan], dtype=dtype)
+    right = np.array([1.0, 2.0, np.nan], dtype=dtype)
+    assert array_equivalent(left, right, dtype_equal=dtype_equal)
+
+    other = np.array([1.0, 3.0, np.nan], dtype=dtype)
+    assert not array_equivalent(left, other, dtype_equal=dtype_equal)
+
+
+def test_array_equivalent_nonnative_complex_bytes():
+    # GH#65192 viewing byte-swapped complex as native float pairs reinterpreted
+    # the bytes, so distinct values could compare equal. Build big-endian
+    # storage whose native reinterpretation lands on NaN.
+    nan_bytes = np.float64(np.nan).tobytes()
+    val1 = float(np.frombuffer(nan_bytes, dtype=">f8")[0])
+    other_nan = np.frombuffer(np.uint64(0x7FF8000000000123).tobytes(), dtype="<f8")[0]
+    val2 = float(np.frombuffer(other_nan.tobytes(), dtype=">f8")[0])
+
+    left = np.array([complex(val1, 0.0)], dtype=">c16")
+    right = np.array([complex(val2, 0.0)], dtype=">c16")
+    # these are distinct finite big-endian values, so not equivalent
+    assert not array_equivalent(left, right, dtype_equal=True)
+    assert array_equivalent(left, left.copy(), dtype_equal=True)
+
+
+@pytest.mark.parametrize("dtype_equal", [True, False])
+@pytest.mark.parametrize("dtype", ["c16", "c8", ">c16", ">c8"])
+def test_array_equivalent_complex_nan_component(dtype, dtype_equal):
+    # GH#66160 a complex value is NA if either part is NaN, so two elements that
+    # are both NA are equivalent even when their non-NaN parts differ. The
+    # fastpath viewed complex as float pairs and compared parts independently,
+    # returning the wrong answer (and disagreeing with the dtype_equal=False
+    # path) for native complex.
+    left = np.array([complex(1, np.nan)], dtype=dtype)
+    right = np.array([complex(2, np.nan)], dtype=dtype)
+    assert array_equivalent(left, right, dtype_equal=dtype_equal)
+
+    # NaN in the real part, differing imaginary parts -- still both NA
+    left = np.array([complex(np.nan, 1)], dtype=dtype)
+    right = np.array([complex(np.nan, 2)], dtype=dtype)
+    assert array_equivalent(left, right, dtype_equal=dtype_equal)
+
+    # a genuine NA element mixed with an equal finite element
+    left = np.array([1 + 2j, complex(3, np.nan)], dtype=dtype)
+    right = np.array([1 + 2j, complex(9, np.nan)], dtype=dtype)
+    assert array_equivalent(left, right, dtype_equal=dtype_equal)
+
+    # differing finite elements are not equivalent
+    right = np.array([5 + 2j, complex(9, np.nan)], dtype=dtype)
+    assert not array_equivalent(left, right, dtype_equal=dtype_equal)
+
+
+@pytest.mark.parametrize("dtype_equal", [True, False])
 def test_array_equivalent_tdi(dtype_equal):
     assert array_equivalent(
         TimedeltaIndex([0, np.nan]),
@@ -458,15 +512,7 @@ def test_array_equivalent_dti(dtype_equal):
 )
 def test_array_equivalent_series(val):
     arr = np.array([1, 2])
-    msg = "elementwise comparison failed"
-    cm = (
-        # stacklevel is chosen to make sense when called from .equals
-        tm.assert_produces_warning(FutureWarning, match=msg, check_stacklevel=False)
-        if isinstance(val, str) and not np_version_gte1p25
-        else nullcontext()
-    )
-    with cm:
-        assert not array_equivalent(Series([arr, arr]), Series([arr, val]))
+    assert not array_equivalent(Series([arr, arr]), Series([arr, val]))
 
 
 def test_array_equivalent_array_mismatched_shape():
@@ -697,6 +743,9 @@ def test_array_equivalent_index_with_tuples():
         ("f2", np.nan),
         ("f4", np.nan),
         ("f8", np.nan),
+        # Complex
+        ("c8", np.nan),
+        ("c16", np.nan),
         # Object
         ("O", np.nan),
         # Interval
@@ -773,11 +822,11 @@ na_vals = (
         np.float32("NaN"),
         np.complex64(np.nan),
         np.complex128(np.nan),
-        np.datetime64("NaT"),
-        np.timedelta64("NaT"),
+        np.datetime64("NaT", "ns"),
+        np.timedelta64("NaT", "ns"),
     ]
-    + [np.datetime64("NaT", unit) for unit in m8_units]
-    + [np.timedelta64("NaT", unit) for unit in m8_units]
+    + [np.datetime64("NaT", unit) for unit in m8_units]  # type: ignore[call-overload]
+    + [np.timedelta64("NaT", unit) for unit in m8_units]  # type: ignore[call-overload]
 )
 
 inf_vals = [

@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from pandas.errors import ParserError
+from pandas.errors import (
+    Pandas4Warning,
+    ParserError,
+)
 
 import pandas._testing as tm
 
@@ -103,8 +106,12 @@ x   q   30      3    -0.6662 -0.5243 -0.3580  0.89145  2.5838"""
             )
 
             kwargs = {default: object()}
+            warn = Pandas4Warning if default == "float_precision" else None
             with pytest.raises(ValueError, match=msg):
-                read_csv(StringIO(data), engine=python_engine, **kwargs)
+                with tm.assert_produces_warning(
+                    warn, match="float_precision", check_stacklevel=False
+                ):
+                    read_csv(StringIO(data), engine=python_engine, **kwargs)
 
     def test_python_engine_file_no_iter(self, python_engine):
         # see gh-16530
@@ -122,7 +129,9 @@ x   q   30      3    -0.6662 -0.5243 -0.3580  0.89145  2.5838"""
                 return self.data
 
         data = "a\n1"
-        msg = "'NoNextBuffer' object is not iterable|argument 1 must be an iterator"
+        msg = "|".join(
+            ["'NoNextBuffer' object is not iterable", "argument 1 must be an iterator"]
+        )
 
         with pytest.raises(TypeError, match=msg):
             read_csv(NoNextBuffer(data), engine=python_engine)
@@ -147,8 +156,12 @@ x   q   30      3    -0.6662 -0.5243 -0.3580  0.89145  2.5838"""
             elif default == "on_bad_lines":
                 kwargs[default] = "warn"
 
+            warn = Pandas4Warning if default == "float_precision" else None
             with pytest.raises(ValueError, match=msg):
-                read_csv(StringIO(data), engine="pyarrow", **kwargs)
+                with tm.assert_produces_warning(
+                    warn, match="float_precision", check_stacklevel=False
+                ):
+                    read_csv(StringIO(data), engine="pyarrow", **kwargs)
 
     def test_on_bad_lines_callable_python_or_pyarrow(self, all_parsers):
         # GH 5686
@@ -167,7 +180,7 @@ x   q   30      3    -0.6662 -0.5243 -0.3580  0.89145  2.5838"""
             parser.read_csv(sio, on_bad_lines=bad_lines_func)
 
 
-def test_close_file_handle_on_invalid_usecols(all_parsers):
+def test_close_file_handle_on_invalid_usecols(all_parsers, temp_file):
     # GH 45384
     parser = all_parsers
 
@@ -176,13 +189,13 @@ def test_close_file_handle_on_invalid_usecols(all_parsers):
         # Raises pyarrow.lib.ArrowKeyError
         pytest.skip(reason="https://github.com/apache/arrow/issues/38676")
 
-    with tm.ensure_clean("test.csv") as fname:
-        Path(fname).write_text("col1,col2\na,b\n1,2", encoding="utf-8")
-        with tm.assert_produces_warning(False):
-            with pytest.raises(error, match="col3"):
-                parser.read_csv(fname, usecols=["col1", "col2", "col3"])
-        # unlink fails on windows if file handles still point to it
-        os.unlink(fname)
+    fname = temp_file
+    Path(fname).write_text("col1,col2\na,b\n1,2", encoding="utf-8")
+    with tm.assert_produces_warning(False):
+        with pytest.raises(error, match="col3"):
+            parser.read_csv(fname, usecols=["col1", "col2", "col3"])
+    # unlink fails on windows if file handles still point to it
+    os.unlink(fname)
 
 
 def test_invalid_file_inputs(request, all_parsers):

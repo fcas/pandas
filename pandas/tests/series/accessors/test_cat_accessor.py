@@ -1,11 +1,15 @@
 import numpy as np
 import pytest
 
+from pandas.errors import Pandas4Warning
+
 from pandas import (
     Categorical,
     DataFrame,
+    DatetimeIndex,
     Index,
     Series,
+    TimedeltaIndex,
     Timestamp,
     date_range,
     period_range,
@@ -40,7 +44,7 @@ class TestCatAccessor:
     def test_cat_accessor(self):
         ser = Series(Categorical(["a", "b", np.nan, "a"]))
         tm.assert_index_equal(ser.cat.categories, Index(["a", "b"]))
-        assert not ser.cat.ordered, False
+        assert not ser.cat.ordered
 
         exp = Categorical(["a", "b", np.nan, "a"], categories=["b", "a"])
 
@@ -140,8 +144,8 @@ class TestCatAccessor:
     @pytest.mark.parametrize(
         "idx",
         [
-            date_range("1/1/2015", periods=5),
-            date_range("1/1/2015", periods=5, tz="MET"),
+            date_range("1/1/2015", periods=5, unit="ns"),
+            date_range("1/1/2015", periods=5, tz="MET", unit="ns"),
             period_range("1/1/2015", freq="D", periods=5),
             timedelta_range("1 days", "10 days"),
         ],
@@ -154,7 +158,11 @@ class TestCatAccessor:
 
         # only testing field (like .day)
         # and bool (is_month_start)
-        attr_names = type(ser._values)._datetimelike_ops
+        # ``freq`` is exposed on the dt accessor but not on the underlying
+        # array's _datetimelike_ops list, so add it explicitly.
+        attr_names = list(type(ser._values)._datetimelike_ops)
+        if isinstance(idx, (DatetimeIndex, TimedeltaIndex)):
+            attr_names.append("freq")
 
         assert isinstance(cat.dt, Properties)
 
@@ -202,7 +210,7 @@ class TestCatAccessor:
                 warn_cls.append(UserWarning)
             elif func == "to_pytimedelta":
                 # GH 57463
-                warn_cls.append(FutureWarning)
+                warn_cls.append(Pandas4Warning)
             if warn_cls:
                 warn_cls = tuple(warn_cls)
             else:
@@ -213,9 +221,18 @@ class TestCatAccessor:
 
             tm.assert_equal(res, exp)
 
+        # GH#46768 - exclude deprecated aliases
+        _deprecated = {"dayofweek", "dayofyear", "daysinmonth", "weekday"}
         for attr in attr_names:
-            res = getattr(cat.dt, attr)
-            exp = getattr(ser.dt, attr)
+            if attr in _deprecated:
+                continue
+            if attr == "freq" and idx.dtype.kind in "Mm":
+                warn_cls = Pandas4Warning
+            else:
+                warn_cls = None
+            with tm.assert_produces_warning(warn_cls):
+                res = getattr(cat.dt, attr)
+                exp = getattr(ser.dt, attr)
 
             tm.assert_equal(res, exp)
 

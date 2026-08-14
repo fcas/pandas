@@ -77,7 +77,10 @@ class TestConstructors:
         assert arr.dtype == SparseDtype(object, False)
         assert arr.fill_value is False
         arr_expected = np.array(data, dtype=object)
-        it = (type(x) == type(y) and x == y for x, y in zip(arr, arr_expected))
+        it = (
+            type(x) == type(y) and x == y
+            for x, y in zip(arr, arr_expected, strict=True)
+        )
         assert np.fromiter(it, dtype=np.bool_).all()
 
     @pytest.mark.parametrize("dtype", [SparseDtype(int, 0), int])
@@ -104,8 +107,8 @@ class TestConstructors:
     def test_constructor_spindex_dtype(self):
         arr = SparseArray(data=[1, 2], sparse_index=IntIndex(4, [1, 2]))
         # TODO: actionable?
-        # XXX: Behavior change: specifying SparseIndex no longer changes the
-        # fill_value
+        # Note: Behavior change: specifying SparseIndex no longer changes
+        # the fill_value
         expected = SparseArray([0, 1, 2, 0], kind="integer")
         tm.assert_sp_array_equal(arr, expected)
         assert arr.dtype == SparseDtype(np.int64)

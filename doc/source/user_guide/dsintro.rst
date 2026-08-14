@@ -44,7 +44,8 @@ Here, ``data`` can be many different things:
 The passed **index** is a list of axis labels. The constructor's behavior
 depends on **data**'s type:
 
-**From ndarray**
+From ndarray
+~~~~~~~~~~~~
 
 If ``data`` is an ndarray, **index** must be the same length as **data**. If no
 index is passed, one will be created having values ``[0, ..., len(data) - 1]``.
@@ -63,7 +64,8 @@ index is passed, one will be created having values ``[0, ..., len(data) - 1]``.
     that does not support duplicate index values is attempted, an exception
     will be raised at that time.
 
-**From dict**
+From dict
+~~~~~~~~~
 
 :class:`Series` can be instantiated from dicts:
 
@@ -85,10 +87,12 @@ index will be pulled out.
 
     NaN (not a number) is the standard missing data marker used in pandas.
 
-**From scalar value**
+From scalar value
+~~~~~~~~~~~~~~~~~
 
-If ``data`` is a scalar value, an index must be
-provided. The value will be repeated to match the length of **index**.
+If ``data`` is a scalar value, the value will be repeated to match
+the length of **index**.  If the **index** is not provided, it defaults
+to ``RangeIndex(1)``.
 
 .. ipython:: python
 
@@ -325,7 +329,7 @@ This case is handled identically to a dict of arrays.
 
 .. ipython:: python
 
-   data = np.zeros((2,), dtype=[("A", "i4"), ("B", "f4"), ("C", "a10")])
+   data = np.zeros((2,), dtype=[("A", "i4"), ("B", "f4"), ("C", "S10")])
    data[:] = [(1, 2.0, "Hello"), (2, 3.0, "World")]
 
    pd.DataFrame(data)
@@ -390,10 +394,9 @@ From a list of namedtuples
 
 The field names of the first ``namedtuple`` in the list determine the columns
 of the :class:`DataFrame`. The remaining namedtuples (or tuples) are simply unpacked
-and their values are fed into the rows of the :class:`DataFrame`. If any of those
-tuples is shorter than the first ``namedtuple`` then the later columns in the
-corresponding row are marked as missing values. If any are longer than the
-first ``namedtuple``, a ``ValueError`` is raised.
+and their values are fed into the rows of the :class:`DataFrame`, and should all
+have the same length as the first ``namedtuple``. Passing entries of differing
+lengths is deprecated.
 
 .. ipython:: python
 
@@ -402,10 +405,6 @@ first ``namedtuple``, a ``ValueError`` is raised.
     Point = namedtuple("Point", "x y")
 
     pd.DataFrame([Point(0, 0), Point(0, 3), (2, 3)])
-
-    Point3D = namedtuple("Point3D", "x y z")
-
-    pd.DataFrame([Point3D(0, 0, 0), Point3D(0, 3, 5), Point(2, 3)])
 
 
 .. _basics.dataframe.from_list_dataclasses:
@@ -434,6 +433,8 @@ To construct a DataFrame with missing data, we use ``np.nan`` to
 represent missing values. Alternatively, you may pass a ``numpy.MaskedArray``
 as the data argument to the DataFrame constructor, and its masked entries will
 be considered missing. See :ref:`Missing data <missing_data>` for more.
+Note that masked arrays with a structured dtype are not supported;
+constructing a DataFrame from one raises an error.
 
 Alternate constructors
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -551,6 +552,12 @@ a function of one argument to be evaluated on the DataFrame being assigned to.
 .. ipython:: python
 
    iris.assign(sepal_ratio=lambda x: (x["SepalWidth"] / x["SepalLength"])).head()
+
+or, using :meth:`pandas.col`:
+
+.. ipython:: python
+
+   iris.assign(sepal_ratio=pd.col("SepalWidth") / pd.col("SepalLength")).head()
 
 :meth:`~pandas.DataFrame.assign` **always** returns a copy of the data, leaving the original
 DataFrame untouched.

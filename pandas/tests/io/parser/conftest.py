@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from pandas.compat import HAS_PYARROW
 from pandas.compat._optional import VERSIONS
 
 from pandas import (
@@ -95,14 +96,6 @@ class PyArrowParser(BaseParser):
 
 
 @pytest.fixture
-def csv_dir_path(datapath):
-    """
-    The directory path to the data files needed for parser tests.
-    """
-    return datapath("io", "parser", "data")
-
-
-@pytest.fixture
 def csv1(datapath):
     """
     The path to the data file "test1.csv" needed for parser tests.
@@ -117,7 +110,15 @@ _pyarrowParser = PyArrowParser
 
 _py_parsers_only = [_pythonParser]
 _c_parsers_only = [_cParserHighMemory, _cParserLowMemory]
-_pyarrow_parsers_only = [pytest.param(_pyarrowParser, marks=pytest.mark.single_cpu)]
+_pyarrow_parsers_only = [
+    pytest.param(
+        _pyarrowParser,
+        marks=[
+            pytest.mark.single_cpu,
+            pytest.mark.skipif(not HAS_PYARROW, reason="pyarrow is not installed"),
+        ],
+    )
+]
 
 _all_parsers = [*_c_parsers_only, *_py_parsers_only, *_pyarrow_parsers_only]
 
@@ -175,13 +176,22 @@ def _get_all_parser_float_precision_combinations():
     """
     params = []
     ids = []
-    for parser, parser_id in zip(_all_parsers, _all_parser_ids):
+    for parser, parser_id in zip(_all_parsers, _all_parser_ids, strict=True):
         if hasattr(parser, "values"):
             # Wrapped in pytest.param, get the actual parser back
             parser = parser.values[0]
         for precision in parser.float_precision_choices:
             # Re-wrap in pytest.param for pyarrow
-            mark = pytest.mark.single_cpu if parser.engine == "pyarrow" else ()
+            mark = (
+                [
+                    pytest.mark.single_cpu,
+                    pytest.mark.skipif(
+                        not HAS_PYARROW, reason="pyarrow is not installed"
+                    ),
+                ]
+                if parser.engine == "pyarrow"
+                else ()
+            )
             param = pytest.param((parser(), precision), marks=mark)
             params.append(param)
             ids.append(f"{parser_id}-{precision}")

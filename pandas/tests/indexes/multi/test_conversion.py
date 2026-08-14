@@ -16,6 +16,36 @@ def test_to_numpy(idx):
     tm.assert_numpy_array_equal(result, exp)
 
 
+def test_array_interface(idx):
+    # https://github.com/pandas-dev/pandas/pull/60046
+    result = np.asarray(idx)
+    expected = np.empty((6,), dtype=object)
+    expected[:] = [
+        ("foo", "one"),
+        ("foo", "two"),
+        ("bar", "one"),
+        ("baz", "two"),
+        ("qux", "one"),
+        ("qux", "two"),
+    ]
+    tm.assert_numpy_array_equal(result, expected)
+
+    # it always gives a copy by default, but the values are cached, so results
+    # are still sharing memory
+    result_copy1 = np.asarray(idx)
+    result_copy2 = np.asarray(idx)
+    assert np.may_share_memory(result_copy1, result_copy2)
+
+    # with explicit copy=True, then it is an actual copy
+    result_copy1 = np.array(idx, copy=True)
+    result_copy2 = np.array(idx, copy=True)
+    assert not np.may_share_memory(result_copy1, result_copy2)
+
+    # for MultiIndex, copy=False is never allowed
+    with pytest.raises(ValueError, match="Unable to avoid copy while creating"):
+        np.array(idx, copy=False)
+
+
 def test_to_frame():
     tuples = [(1, "one"), (1, "two"), (2, "one"), (2, "two")]
 

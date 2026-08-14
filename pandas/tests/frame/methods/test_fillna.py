@@ -1,12 +1,16 @@
 import numpy as np
 import pytest
 
-from pandas._config import using_pyarrow_string_dtype
+from pandas.errors import (
+    OutOfBoundsDatetime,
+    Pandas4Warning,
+)
 
 from pandas import (
     Categorical,
     DataFrame,
     DatetimeIndex,
+    MultiIndex,
     NaT,
     PeriodIndex,
     Series,
@@ -14,6 +18,7 @@ from pandas import (
     Timestamp,
     date_range,
     to_datetime,
+    to_numeric,
 )
 import pandas._testing as tm
 from pandas.tests.frame.common import _check_mixed_float
@@ -21,13 +26,16 @@ from pandas.tests.frame.common import _check_mixed_float
 
 class TestFillNA:
     def test_fillna_dict_inplace_nonunique_columns(self):
+        # GH#38966
         df = DataFrame(
             {"A": [np.nan] * 3, "B": [NaT, Timestamp(1), NaT], "C": [np.nan, "foo", 2]}
         )
         df.columns = ["A", "A", "A"]
         orig = df[:]
 
-        df.fillna({"A": 2}, inplace=True)
+        # GH#45153 filling datetime with int is deprecated
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+            df.fillna({"A": 2}, inplace=True)
         # The first and third columns can be set inplace, while the second cannot.
 
         expected = DataFrame(
@@ -47,7 +55,7 @@ class TestFillNA:
         assert np.isnan(arr[:, 0]).all()
 
         # i.e. we didn't create a new 49-column block
-        assert len(df._mgr.arrays) == 1
+        assert len(df._mgr.blocks) == 1
         assert np.shares_memory(df.values, arr)
 
     def test_fillna_datetime(self, datetime_frame):
@@ -65,14 +73,23 @@ class TestFillNA:
         with pytest.raises(TypeError, match=msg):
             datetime_frame.fillna()
 
-    @pytest.mark.xfail(using_pyarrow_string_dtype(), reason="can't fill 0 in string")
-    def test_fillna_mixed_type(self, float_string_frame):
+    def test_fillna_mixed_type(self, float_string_frame, using_infer_string):
         mf = float_string_frame
         mf.loc[mf.index[5:20], "foo"] = np.nan
         mf.loc[mf.index[-10:], "A"] = np.nan
-        # TODO: make stronger assertion here, GH 25640
-        mf.fillna(value=0)
-        mf.ffill()
+
+        result = mf.ffill()
+        assert (
+            result.loc[result.index[-10:], "A"] == result.loc[result.index[-11], "A"]
+        ).all()
+        assert (result.loc[result.index[5:20], "foo"] == "bar").all()
+
+        # GH#45153 filling string column with int is deprecated
+        warn = Pandas4Warning if using_infer_string else None
+        with tm.assert_produces_warning(warn, match="fill value"):
+            result = mf.fillna(value=0)
+        assert (result.loc[result.index[-10:], "A"] == 0).all()
+        assert (result.loc[result.index[5:20], "foo"] == 0).all()
 
     def test_fillna_mixed_float(self, mixed_float_frame):
         # mixed numeric (but no float16)
@@ -83,29 +100,26 @@ class TestFillNA:
         result = mf.ffill()
         _check_mixed_float(result, dtype={"C": None})
 
-    def test_fillna_different_dtype(self, using_infer_string):
+    def test_fillna_different_dtype(self):
         # with different dtype (GH#3386)
         df = DataFrame(
             [["a", "a", np.nan, "a"], ["b", "b", np.nan, "b"], ["c", "c", np.nan, "c"]]
         )
 
-        if using_infer_string:
-            with tm.assert_produces_warning(FutureWarning, match="Downcasting"):
-                result = df.fillna({2: "foo"})
-        else:
+        # GH#45153 filling float with string is deprecated
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
             result = df.fillna({2: "foo"})
         expected = DataFrame(
             [["a", "a", "foo", "a"], ["b", "b", "foo", "b"], ["c", "c", "foo", "c"]]
         )
+        # column is originally float (all-NaN) -> filling with string gives object dtype
+        expected[2] = expected[2].astype("object")
         tm.assert_frame_equal(result, expected)
 
-        if using_infer_string:
-            with tm.assert_produces_warning(FutureWarning, match="Downcasting"):
-                return_value = df.fillna({2: "foo"}, inplace=True)
-        else:
-            return_value = df.fillna({2: "foo"}, inplace=True)
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+            result = df.fillna({2: "foo"}, inplace=True)
+        assert result is df
         tm.assert_frame_equal(df, expected)
-        assert return_value is None
 
     def test_fillna_limit_and_value(self):
         # limit and value
@@ -257,6 +271,20 @@ class TestFillNA:
         df = DataFrame({"a": Categorical(idx)})
         tm.assert_frame_equal(df.fillna(value=NaT), df)
 
+    def test_fillna_with_categorical_series(self):
+        # https://github.com/pandas-dev/pandas/issues/56329
+        df = DataFrame(
+            {"cats": Categorical(["A", "B", "C"]), "ints": [1.0, 2.0, np.nan]}
+        )
+
+        filler = Series(Categorical([10.0, 20.0, 30.0]))
+        result = df.fillna({"ints": filler})
+
+        expected = DataFrame(
+            {"cats": Categorical(["A", "B", "C"]), "ints": [1.0, 2.0, 30.0]}
+        )
+        tm.assert_frame_equal(result, expected)
+
     def test_fillna_no_downcast(self, frame_or_series):
         # GH#45603 preserve object dtype
         obj = frame_or_series([1, 2, 3], dtype="object")
@@ -274,7 +302,7 @@ class TestFillNA:
         expected["A"] = 0.0
         tm.assert_frame_equal(result, expected)
 
-    def test_fillna_dtype_conversion(self, using_infer_string):
+    def test_fillna_dtype_conversion(self):
         # make sure that fillna on an empty frame works
         df = DataFrame(index=["A", "B", "C"], columns=[1, 2, 3, 4, 5])
         result = df.dtypes
@@ -288,15 +316,20 @@ class TestFillNA:
 
         # empty block
         df = DataFrame(index=range(3), columns=["A", "B"], dtype="float64")
-        result = df.fillna("nan")
-        expected = DataFrame("nan", index=range(3), columns=["A", "B"])
+        # GH#45153 filling float with string is deprecated
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+            result = df.fillna("nan")
+        expected = DataFrame("nan", dtype="object", index=range(3), columns=["A", "B"])
         tm.assert_frame_equal(result, expected)
 
     @pytest.mark.parametrize("val", ["", 1, np.nan, 1.0])
     def test_fillna_dtype_conversion_equiv_replace(self, val):
         df = DataFrame({"A": [1, np.nan], "B": [1.0, 2.0]})
         expected = df.replace(np.nan, val)
-        result = df.fillna(val)
+        # GH#45153 filling with incompatible value is deprecated
+        warn = Pandas4Warning if isinstance(val, str) else None
+        with tm.assert_produces_warning(warn, match="fill value"):
+            result = df.fillna(val)
         tm.assert_frame_equal(result, expected)
 
     def test_fillna_datetime_columns(self):
@@ -310,7 +343,9 @@ class TestFillNA:
             },
             index=date_range("20130110", periods=3),
         )
-        result = df.fillna("?")
+        # GH#45153 filling float with string is deprecated
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+            result = df.fillna("?")
         expected = DataFrame(
             {
                 "A": [-1, -2, "?"],
@@ -331,7 +366,9 @@ class TestFillNA:
             },
             index=date_range("20130110", periods=3),
         )
-        result = df.fillna("?")
+        # GH#45153 filling datetime with string is deprecated
+        with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+            result = df.fillna("?")
         expected = DataFrame(
             {
                 "A": [-1, -2, "?"],
@@ -423,11 +460,12 @@ class TestFillNA:
         expected = df.fillna(value=0)
         assert expected is not df
 
-        df.fillna(value=0, inplace=True)
+        result = df.fillna(value=0, inplace=True)
+        assert result is df
         tm.assert_frame_equal(df, expected)
 
-        expected = df.fillna(value={0: 0}, inplace=True)
-        assert expected is None
+        result = df.fillna(value={0: 0}, inplace=True)
+        assert result is df
 
         df.loc[:4, 1] = np.nan
         df.loc[-4:, 3] = np.nan
@@ -461,9 +499,48 @@ class TestFillNA:
         expected = df.fillna(df.max().to_dict())
         tm.assert_frame_equal(result, expected)
 
-        # disable this for now
-        with pytest.raises(NotImplementedError, match="column by column"):
-            df.fillna(df.max(axis=1), axis=1)
+    def test_fillna_dict_series_axis_1(self):
+        df = DataFrame(
+            {
+                "a": [np.nan, 1, 2, np.nan, np.nan],
+                "b": [1, 2, 3, np.nan, np.nan],
+                "c": [np.nan, 1, 2, 3, 4],
+            }
+        )
+        result = df.fillna(df.max(axis=1), axis=1)
+        result = df.fillna(df.max(axis=1), axis=1, inplace=True)
+        assert result is df
+        expected = DataFrame(
+            {
+                "a": [1.0, 1.0, 2.0, 3.0, 4.0],
+                "b": [1.0, 2.0, 3.0, 3.0, 4.0],
+                "c": [1.0, 1.0, 2.0, 3.0, 4.0],
+            }
+        )
+        tm.assert_frame_equal(result, expected)
+        tm.assert_frame_equal(df, expected)
+
+    def test_fillna_dict_series_axis_1_mismatch_cols(self):
+        df = DataFrame(
+            {
+                "a": ["abc", "def", np.nan, "ghi", "jkl"],
+                "b": [1, 2, 3, np.nan, np.nan],
+                "c": [np.nan, 1, 2, 3, 4],
+            }
+        )
+        with pytest.raises(ValueError, match="All columns must have the same dtype"):
+            df.fillna(Series({"a": "abc", "b": "def", "c": "hij"}), axis=1)
+
+    def test_fillna_dict_series_axis_1_value_mismatch_with_cols(self):
+        df = DataFrame(
+            {
+                "a": [np.nan, 1, 2, np.nan, np.nan],
+                "b": [1, 2, 3, np.nan, np.nan],
+                "c": [np.nan, 1, 2, 3, 4],
+            }
+        )
+        with pytest.raises(ValueError, match=".* not a suitable type to fill into .*"):
+            df.fillna(Series({"a": "abc", "b": "def", "c": "hij"}), axis=1)
 
     def test_fillna_dataframe(self):
         # GH#8377
@@ -537,17 +614,10 @@ class TestFillNA:
         filled = df.ffill()
         assert df.columns.tolist() == filled.columns.tolist()
 
-    @pytest.mark.xfail(using_pyarrow_string_dtype(), reason="can't fill 0 in string")
-    def test_fill_corner(self, float_frame, float_string_frame):
-        mf = float_string_frame
-        mf.loc[mf.index[5:20], "foo"] = np.nan
-        mf.loc[mf.index[-10:], "A"] = np.nan
-
-        filled = float_string_frame.fillna(value=0)
-        assert (filled.loc[filled.index[5:20], "foo"] == 0).all()
-        del float_string_frame["foo"]
-
-        float_frame.reindex(columns=[]).fillna(value=0)
+    def test_fill_empty(self, float_frame):
+        df = float_frame.reindex(columns=[])
+        result = df.fillna(value=0)
+        tm.assert_frame_equal(result, df)
 
     def test_fillna_with_columns_and_limit(self):
         # GH40989
@@ -612,7 +682,8 @@ class TestFillNA:
         expected = df.fillna(axis=1, value=100, limit=1)
         assert expected is not df
 
-        df.fillna(axis=1, value=100, limit=1, inplace=True)
+        result = df.fillna(axis=1, value=100, limit=1, inplace=True)
+        assert result is df
         tm.assert_frame_equal(df, expected)
 
     @pytest.mark.parametrize("val", [-1, {"x": -1, "y": -1}])
@@ -677,6 +748,20 @@ class TestFillNA:
         )
         tm.assert_frame_equal(pdf.fillna({("x", "b"): -2, "x": -1}), expected)
 
+    def test_fillna_multiindex_with_duplicate_columns(self):
+        # GH#53498
+        data = [[np.nan, 2, 3], [4, np.nan, 6], [7, 8, np.nan]]
+        df = DataFrame(
+            data,
+            columns=MultiIndex.from_tuples([("x", "a"), ("x", "a"), ("y", "b")]),
+        )
+        result = df.fillna({("x", "a"): 0})
+        expected = DataFrame(
+            [[0.0, 2.0, 3.0], [4.0, 0.0, 6.0], [7.0, 8.0, np.nan]],
+            columns=MultiIndex.from_tuples([("x", "a"), ("x", "a"), ("y", "b")]),
+        )
+        tm.assert_frame_equal(result, expected)
+
 
 def test_fillna_nonconsolidated_frame():
     # https://github.com/pandas-dev/pandas/issues/36495
@@ -699,7 +784,8 @@ def test_fillna_nones_inplace():
         [[None, None], [None, None]],
         columns=["A", "B"],
     )
-    df.fillna(value={"A": 1, "B": 2}, inplace=True)
+    result = df.fillna(value={"A": 1, "B": 2}, inplace=True)
+    assert result is df
 
     expected = DataFrame([[1, 2], [1, 2]], columns=["A", "B"], dtype=object)
     tm.assert_frame_equal(df, expected)
@@ -790,3 +876,43 @@ def test_fillna_with_none_object(test_frame, dtype):
     if test_frame:
         expected = expected.to_frame()
     tm.assert_equal(result, expected)
+
+
+def test_fillna_out_of_bounds_datetime():
+    # GH#61208
+    df = DataFrame(
+        {
+            "datetime": date_range("1/1/2011", periods=3, freq="h", unit="ns"),
+            "value": [1, 2, 3],
+        }
+    )
+    df.iloc[0, 0] = None
+
+    msg = "Cannot cast 0001-01-01 00:00:00 to unit='ns' without overflow"
+    # GH#45153 the Pandas4Warning fires before the OutOfBoundsDatetime
+    with tm.assert_produces_warning(Pandas4Warning, match="fill value"):
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            df.fillna(Timestamp("0001-01-01"))
+
+
+def test_fillna_dtype_preservation_after_apply():
+    # GH#14407 - fillna after apply should preserve dtypes correctly
+    # (block splitting should occur for mixed-dtype results)
+    df = DataFrame(
+        {"c1": list("ABC"), "c2": list("123"), "c3": [1.5, 2.5, 3.5], "c4": [0, 1, 2]}
+    )
+    result = df.apply(lambda x: to_numeric(x, errors="coerce")).fillna(df)
+    assert result["c1"].dtype == object
+    assert result["c2"].dtype == np.int64
+    assert result["c3"].dtype == np.float64
+    assert result["c4"].dtype == np.int64
+
+
+def test_fillna_with_duplicate_index_and_unique_fill_frame():
+    # GH#36974 filling a frame that has a duplicated index from a frame with a
+    # unique index must align by label instead of raising InvalidIndexError
+    df = DataFrame({"a": [np.nan, np.nan, 5.0]}, index=[0, 1, 0])
+    df_fillna = DataFrame({"a": [10.0, 20.0]}, index=[0, 1])
+    result = df.fillna(df_fillna)
+    expected = DataFrame({"a": [10.0, 20.0, 5.0]}, index=[0, 1, 0])
+    tm.assert_frame_equal(result, expected)

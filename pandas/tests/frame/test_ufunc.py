@@ -44,7 +44,7 @@ def test_unary_binary(request, dtype):
     assert len(result_pandas) == 2
     expected_numpy = np.modf(values)
 
-    for result, b in zip(result_pandas, expected_numpy):
+    for result, b in zip(result_pandas, expected_numpy, strict=True):
         expected = pd.DataFrame(b, index=df.index, columns=df.columns)
         tm.assert_frame_equal(result, expected)
 
@@ -95,6 +95,21 @@ def test_ufunc_passes_args(func, arg, expected):
 
     expected = pd.DataFrame(expected)
     tm.assert_frame_equal(result, expected)
+
+
+def test_binary_ufunc_out_pandas_object():
+    # GH#43190 passing a DataFrame as the ufunc `out` argument used to recurse
+    #  infinitely (RecursionError / segfault) instead of writing the result.
+    a = pd.DataFrame([[1, 2]])
+    b = pd.DataFrame([[3, 4]])
+    out = pd.DataFrame([[0, 0]])
+
+    result = np.fmin(a, b, out=out)
+
+    expected = pd.DataFrame([[1, 2]])
+    tm.assert_frame_equal(result, expected)
+    # the result is also written into `out` in place
+    tm.assert_frame_equal(out, expected)
 
 
 @pytest.mark.parametrize("dtype_a", dtypes)
@@ -191,7 +206,7 @@ def test_unary_accumulate_axis():
 
 def test_frame_outer_disallowed():
     df = pd.DataFrame({"A": [1, 2]})
-    with pytest.raises(NotImplementedError, match=""):
+    with pytest.raises(NotImplementedError, match="^$"):
         # deprecation enforced in 2.0
         np.subtract.outer(df, df)
 

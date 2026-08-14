@@ -1,3 +1,4 @@
+import contextlib
 from datetime import (
     date,
     datetime,
@@ -7,8 +8,11 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
-from pandas.compat.numpy import np_version_gte1p24
-from pandas.errors import IndexingError
+from pandas.compat import HAS_PYARROW
+from pandas.errors import (
+    IndexingError,
+    Pandas4Warning,
+)
 
 from pandas.core.dtypes.common import is_list_like
 
@@ -24,6 +28,7 @@ from pandas import (
     NaT,
     Period,
     Series,
+    StringDtype,
     Timedelta,
     Timestamp,
     array,
@@ -40,7 +45,7 @@ from pandas.tseries.offsets import BDay
 
 class TestSetitemDT64Values:
     def test_setitem_none_nan(self):
-        series = Series(date_range("1/1/2000", periods=10))
+        series = Series(date_range("1/1/2000", periods=10, unit="ns"))
         series[3] = None
         assert series[3] is NaT
 
@@ -71,7 +76,7 @@ class TestSetitemDT64Values:
 
     def test_setitem_tuple_with_datetimetz_values(self):
         # GH#20441
-        arr = date_range("2017", periods=4, tz="US/Eastern")
+        arr = date_range("2017", periods=4, tz="US/Eastern", unit="ns")
         index = [(0, 1), (0, 2), (0, 3), (0, 4)]
         result = Series(arr, index=index)
         expected = result.copy()
@@ -81,7 +86,7 @@ class TestSetitemDT64Values:
 
     @pytest.mark.parametrize("tz", ["US/Eastern", "UTC", "Asia/Tokyo"])
     def test_setitem_with_tz(self, tz, indexer_sli):
-        orig = Series(date_range("2016-01-01", freq="h", periods=3, tz=tz))
+        orig = Series(date_range("2016-01-01", freq="h", periods=3, tz=tz, unit="ns"))
         assert orig.dtype == f"datetime64[ns, {tz}]"
 
         exp = Series(
@@ -122,7 +127,7 @@ class TestSetitemDT64Values:
     def test_setitem_with_tz_dst(self, indexer_sli):
         # GH#14146 trouble setting values near DST boundary
         tz = "US/Eastern"
-        orig = Series(date_range("2016-11-06", freq="h", periods=3, tz=tz))
+        orig = Series(date_range("2016-11-06", freq="h", periods=3, tz=tz, unit="ns"))
         assert orig.dtype == f"datetime64[ns, {tz}]"
 
         exp = Series(
@@ -273,24 +278,15 @@ class TestSetitemBooleanMask:
         mask = ts > 0
         left = ts.copy()
         right = ts[mask].copy().map(str)
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             left[mask] = right
-        expected = ts.map(lambda t: str(t) if t > 0 else t)
-        tm.assert_series_equal(left, expected)
 
     def test_setitem_mask_promote_strs(self):
         ser = Series([0, 1, 2, 0])
         mask = ser > 0
         ser2 = ser[mask].map(str)
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             ser[mask] = ser2
-
-        expected = Series([0, "1", "2", 0])
-        tm.assert_series_equal(ser, expected)
 
     def test_setitem_mask_promote(self):
         ser = Series([0, "foo", "bar", 0])
@@ -379,12 +375,8 @@ class TestSetitemBooleanMask:
     def test_setitem_nan_with_bool(self):
         # GH 13034
         result = Series([True, False, True])
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             result[0] = np.nan
-        expected = Series([np.nan, False, True], dtype=object)
-        tm.assert_series_equal(result, expected)
 
     def test_setitem_mask_smallint_upcast(self):
         orig = Series([1, 2, 3], dtype="int8")
@@ -393,22 +385,14 @@ class TestSetitemBooleanMask:
         mask = np.array([True, False, True])
 
         ser = orig.copy()
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             ser[mask] = Series(alt)
+
+        with pytest.raises(TypeError, match="Invalid value"):
+            ser.mask(mask, alt, inplace=True)
+
+        res = ser.where(~mask, Series(alt))
         expected = Series([999, 2, 1001])
-        tm.assert_series_equal(ser, expected)
-
-        ser2 = orig.copy()
-        with tm.assert_produces_warning(
-            FutureWarning, match="item of incompatible dtype"
-        ):
-            ser2.mask(mask, alt, inplace=True)
-        tm.assert_series_equal(ser2, expected)
-
-        ser3 = orig.copy()
-        res = ser3.where(~mask, Series(alt))
         tm.assert_series_equal(res, expected)
 
     def test_setitem_mask_smallint_no_upcast(self):
@@ -436,8 +420,8 @@ class TestSetitemBooleanMask:
 
 class TestSetitemViewCopySemantics:
     def test_setitem_invalidates_datetime_index_freq(self):
-        # GH#24096 altering a datetime64tz Series inplace invalidates the
-        #  `freq` attribute on the underlying DatetimeIndex
+        # GH#24096 altering a datetime64tz Series inplace does not propagate
+        #  back to the underlying DatetimeIndex
 
         dti = date_range("20130101", periods=3, tz="US/Eastern")
         ts = dti[1]
@@ -446,7 +430,6 @@ class TestSetitemViewCopySemantics:
         assert ser._values._ndarray.base is dti._data._ndarray.base
         assert dti.freq == "D"
         ser.iloc[1] = NaT
-        assert ser._values.freq is None
 
         # check that the DatetimeIndex was not altered in place
         assert ser._values is not dti
@@ -461,9 +444,9 @@ class TestSetitemViewCopySemantics:
         ser = Series(dti)
         assert ser._values is not dti
         assert ser._values._ndarray.base is dti._data._ndarray.base
-        assert ser._mgr.arrays[0]._ndarray.base is dti._data._ndarray.base
+        assert ser._mgr.blocks[0].values._ndarray.base is dti._data._ndarray.base
 
-        assert ser._mgr.arrays[0] is not dti
+        assert ser._mgr.blocks[0].values is not dti
 
         ser[::3] = NaT
         assert ser[0] is NaT
@@ -492,12 +475,14 @@ class TestSetitemCallable:
 
 
 class TestSetitemWithExpansion:
-    def test_setitem_empty_series(self):
-        # GH#10193, GH#51363 changed in 3.0 to not do inference in Index.insert
+    def test_setitem_empty_series(self, using_infer_string):
+        # GH#10193
         key = Timestamp("2012-01-01")
         series = Series(dtype=object)
         series[key] = 47
-        expected = Series(47, Index([key], dtype=object))
+        expected = Series(
+            47, index=[key] if using_infer_string else Index([key], dtype=object)
+        )
         tm.assert_series_equal(series, expected)
 
     def test_setitem_empty_series_datetimeindex_preserves_freq(self):
@@ -518,7 +503,10 @@ class TestSetitemWithExpansion:
 
         series = Series([], dtype=object)
         series["anything"] = 300.0
-        series["timestamp"] = timestamp
+        # the existing dtype is float64 here, so inserting a Timestamp
+        #  changes it to object
+        with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+            series["timestamp"] = timestamp
         result = series["timestamp"]
         assert result == expected
 
@@ -532,19 +520,21 @@ class TestSetitemWithExpansion:
     )
     def test_append_timedelta_does_not_cast(self, td, using_infer_string, request):
         # GH#22717 inserting a Timedelta should _not_ cast to int64
-        if using_infer_string and not isinstance(td, Timedelta):
-            # TODO: GH#56010
-            request.applymarker(pytest.mark.xfail(reason="inferred as string"))
-
         expected = Series(["x", td], index=[0, "td"], dtype=object)
 
+        # With infer_string, dtype changes from str -> object; without it,
+        # the Series is already object so no dtype change occurs.
+        warn = Pandas4Warning if using_infer_string else None
+
         ser = Series(["x"])
-        ser["td"] = td
+        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            ser["td"] = td
         tm.assert_series_equal(ser, expected)
         assert isinstance(ser["td"], Timedelta)
 
         ser = Series(["x"])
-        ser.loc["td"] = Timedelta("9 days")
+        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            ser.loc["td"] = Timedelta("9 days")
         tm.assert_series_equal(ser, expected)
         assert isinstance(ser["td"], Timedelta)
 
@@ -552,7 +542,10 @@ class TestSetitemWithExpansion:
         # GH#12599
         ser = Series(dtype=object)
         ser["a"] = Timestamp("2016-01-01")
-        ser["b"] = 3.0
+        # After the first insert ser has datetime64 dtype; inserting a float
+        # is incompatible with that.
+        with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+            ser["b"] = 3.0
         ser["c"] = "foo"
         expected = Series([Timestamp("2016-01-01"), 3.0, "foo"], index=["a", "b", "c"])
         tm.assert_series_equal(ser, expected)
@@ -575,48 +568,64 @@ class TestSetitemWithExpansion:
         tm.assert_series_equal(ser, expected)
 
     @pytest.mark.parametrize(
-        "na, target_na, dtype, target_dtype, indexer, warn",
+        "na, target_na, dtype, target_dtype, indexer, raises",
         [
-            (NA, NA, "Int64", "Int64", 1, None),
-            (NA, NA, "Int64", "Int64", 2, None),
-            (NA, np.nan, "int64", "float64", 1, None),
-            (NA, np.nan, "int64", "float64", 2, None),
-            (NaT, NaT, "int64", "object", 1, FutureWarning),
-            (NaT, NaT, "int64", "object", 2, None),
-            (np.nan, NA, "Int64", "Int64", 1, None),
-            (np.nan, NA, "Int64", "Int64", 2, None),
-            (np.nan, NA, "Float64", "Float64", 1, None),
-            (np.nan, NA, "Float64", "Float64", 2, None),
-            (np.nan, np.nan, "int64", "float64", 1, None),
-            (np.nan, np.nan, "int64", "float64", 2, None),
+            (NA, NA, "Int64", "Int64", 1, False),
+            (NA, NA, "Int64", "Int64", 2, False),
+            (NA, np.nan, "int64", "float64", 1, False),
+            (NA, np.nan, "int64", "float64", 2, False),
+            (NaT, NaT, "int64", "object", 1, True),
+            (NaT, NaT, "int64", "object", 2, False),
+            (np.nan, NA, "Int64", "Int64", 1, False),
+            (np.nan, NA, "Int64", "Int64", 2, False),
+            (np.nan, NA, "Float64", "Float64", 1, False),
+            (np.nan, NA, "Float64", "Float64", 2, False),
+            (np.nan, np.nan, "int64", "float64", 1, False),
+            (np.nan, np.nan, "int64", "float64", 2, False),
         ],
     )
     def test_setitem_enlarge_with_na(
-        self, na, target_na, dtype, target_dtype, indexer, warn
+        self, na, target_na, dtype, target_dtype, indexer, raises
     ):
         # GH#32346
         ser = Series([1, 2], dtype=dtype)
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
-            ser[indexer] = na
-        expected_values = [1, target_na] if indexer == 1 else [1, 2, target_na]
-        expected = Series(expected_values, dtype=target_dtype)
-        tm.assert_series_equal(ser, expected)
+        if raises:
+            with pytest.raises(TypeError, match="Invalid value"):
+                ser[indexer] = na
+        else:
+            # GH#62369 enlargement silently changing int64 -> object warns
+            warn = Pandas4Warning if indexer == 2 and target_dtype == "object" else None
+            with tm.assert_produces_warning(warn, match="incompatible dtype"):
+                ser[indexer] = na
+            expected_values = [1, target_na] if indexer == 1 else [1, 2, target_na]
+            expected = Series(expected_values, dtype=target_dtype)
+            tm.assert_series_equal(ser, expected)
 
     def test_setitem_enlargement_object_none(self, nulls_fixture, using_infer_string):
         # GH#48665
         ser = Series(["a", "b"])
-        ser[3] = nulls_fixture
+
         dtype = (
-            "string[pyarrow_numpy]"
-            if using_infer_string and not isinstance(nulls_fixture, Decimal)
+            "str"
+            if using_infer_string
+            and not (isinstance(nulls_fixture, Decimal) and not HAS_PYARROW)
             else object
         )
+
+        # Warn when the dtype changes (str -> object for Decimal without
+        # pyarrow); no warning when the dtype is preserved.
+        warn = Pandas4Warning if ser.dtype != dtype else None
+        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            ser[3] = nulls_fixture
+
         expected = Series(["a", "b", nulls_fixture], index=[0, 1, 3], dtype=dtype)
         tm.assert_series_equal(ser, expected)
-        if using_infer_string:
+        if dtype == "str":
             ser[3] is np.nan
-        else:
+        elif using_infer_string:
             assert ser[3] is nulls_fixture
+        else:
+            assert type(ser[3]) is type(nulls_fixture)
 
 
 def test_setitem_scalar_into_readonly_backing_data():
@@ -694,14 +703,8 @@ class TestSetitemCasting:
         if not unique:
             ser.index = [1, 1]
 
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        with pytest.raises(TypeError, match="Invalid value"):
             indexer_sli(ser)[1] = val
-        assert type(ser.iloc[1]) == type(val)
-
-        expected = Series([True, val], dtype=object, index=ser.index)
-        if not unique and indexer_sli is not tm.iloc:
-            expected = Series([val, val], dtype=object, index=[1, 1])
-        tm.assert_series_equal(ser, expected)
 
     def test_setitem_boolean_array_into_npbool(self):
         # GH#45462
@@ -712,10 +715,8 @@ class TestSetitemCasting:
         ser[:2] = arr[:2]  # no NAs -> can set inplace
         assert ser._values is values
 
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        with pytest.raises(TypeError, match="Invalid value"):
             ser[1:] = arr[1:]  # has an NA -> cast to boolean dtype
-        expected = Series(arr)
-        tm.assert_series_equal(ser, expected)
 
 
 class SetitemCastingEquivalents:
@@ -759,64 +760,72 @@ class SetitemCastingEquivalents:
             # otherwise original array should be unchanged
             tm.assert_equal(arr, orig._values)
 
-    def test_int_key(self, obj, key, expected, warn, val, indexer_sli, is_inplace):
+    def test_int_key(self, obj, key, expected, raises, val, indexer_sli, is_inplace):
         if not isinstance(key, int):
             pytest.skip("Not relevant for int key")
+        if raises:
+            ctx = pytest.raises(TypeError, match="Invalid value")
+        else:
+            ctx = contextlib.nullcontext()
 
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, key, expected, val, indexer_sli, is_inplace)
 
         if indexer_sli is tm.loc:
-            with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            with ctx:
                 self.check_indexer(obj, key, expected, val, tm.at, is_inplace)
         elif indexer_sli is tm.iloc:
-            with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            with ctx:
                 self.check_indexer(obj, key, expected, val, tm.iat, is_inplace)
 
         rng = range(key, key + 1)
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, rng, expected, val, indexer_sli, is_inplace)
 
         if indexer_sli is not tm.loc:
             # Note: no .loc because that handles slice edges differently
             slc = slice(key, key + 1)
-            with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            with ctx:
                 self.check_indexer(obj, slc, expected, val, indexer_sli, is_inplace)
 
         ilkey = [key]
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, ilkey, expected, val, indexer_sli, is_inplace)
 
         indkey = np.array(ilkey)
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, indkey, expected, val, indexer_sli, is_inplace)
 
         genkey = (x for x in [key])
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, genkey, expected, val, indexer_sli, is_inplace)
 
-    def test_slice_key(self, obj, key, expected, warn, val, indexer_sli, is_inplace):
+    def test_slice_key(self, obj, key, expected, raises, val, indexer_sli, is_inplace):
         if not isinstance(key, slice):
             pytest.skip("Not relevant for slice key")
+        if raises:
+            ctx = pytest.raises(TypeError, match="Invalid value")
+        else:
+            ctx = contextlib.nullcontext()
 
         if indexer_sli is not tm.loc:
             # Note: no .loc because that handles slice edges differently
-            with tm.assert_produces_warning(warn, match="incompatible dtype"):
+            with ctx:
                 self.check_indexer(obj, key, expected, val, indexer_sli, is_inplace)
 
         ilkey = list(range(len(obj)))[key]
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, ilkey, expected, val, indexer_sli, is_inplace)
 
         indkey = np.array(ilkey)
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, indkey, expected, val, indexer_sli, is_inplace)
 
         genkey = (x for x in indkey)
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        with ctx:
             self.check_indexer(obj, genkey, expected, val, indexer_sli, is_inplace)
 
-    def test_mask_key(self, obj, key, expected, warn, val, indexer_sli):
+    def test_mask_key(self, obj, key, expected, raises, val, indexer_sli):
         # setitem with boolean mask
         mask = np.zeros(obj.shape, dtype=bool)
         mask[key] = True
@@ -829,11 +838,13 @@ class SetitemCastingEquivalents:
                 indexer_sli(obj)[mask] = val
             return
 
-        with tm.assert_produces_warning(warn, match="incompatible dtype"):
+        if raises:
+            with pytest.raises(TypeError, match="Invalid value"):
+                indexer_sli(obj)[mask] = val
+        else:
             indexer_sli(obj)[mask] = val
-        tm.assert_series_equal(obj, expected)
 
-    def test_series_where(self, obj, key, expected, warn, val, is_inplace):
+    def test_series_where(self, obj, key, expected, raises, val, is_inplace):
         mask = np.zeros(obj.shape, dtype=bool)
         mask[key] = True
 
@@ -860,32 +871,33 @@ class SetitemCastingEquivalents:
 
         self._check_inplace(is_inplace, orig, arr, obj)
 
-    def test_index_where(self, obj, key, expected, warn, val, using_infer_string):
+    def test_index_where(self, obj, key, expected, raises, val):
         mask = np.zeros(obj.shape, dtype=bool)
         mask[key] = True
 
-        if using_infer_string and obj.dtype == object:
-            with pytest.raises(TypeError, match="Scalar must"):
-                Index(obj).where(~mask, val)
-        else:
-            res = Index(obj).where(~mask, val)
-            expected_idx = Index(expected, dtype=expected.dtype)
-            tm.assert_index_equal(res, expected_idx)
+        if is_list_like(val) and len(val) < len(obj):
+            # see test_series_where
+            return
 
-    def test_index_putmask(self, obj, key, expected, warn, val, using_infer_string):
+        res = Index(obj).where(~mask, val)
+        ser_res = obj.where(~mask, val)
+        tm.assert_index_equal(res, Index(ser_res, dtype=ser_res.dtype))
+
+    def test_index_putmask(self, obj, key, expected, raises, val):
         mask = np.zeros(obj.shape, dtype=bool)
         mask[key] = True
 
-        if using_infer_string and obj.dtype == object:
-            with pytest.raises(TypeError, match="Scalar must"):
-                Index(obj).putmask(mask, val)
-        else:
-            res = Index(obj).putmask(mask, val)
-            tm.assert_index_equal(res, Index(expected, dtype=expected.dtype))
+        if is_list_like(val) and len(val) < len(obj):
+            # see test_series_where
+            return
+
+        res = Index(obj).putmask(mask, val)
+        ser_res = obj.where(~mask, val)
+        tm.assert_index_equal(res, Index(ser_res, dtype=ser_res.dtype))
 
 
 @pytest.mark.parametrize(
-    "obj,expected,key,warn",
+    "obj,expected,key,raises",
     [
         pytest.param(
             # GH#45568 setting a valid NA value into IntervalDtype[int] should
@@ -896,7 +908,7 @@ class SetitemCastingEquivalents:
                 dtype="interval[float64]",
             ),
             1,
-            FutureWarning,
+            True,
             id="interval_int_na_value",
         ),
         pytest.param(
@@ -904,14 +916,14 @@ class SetitemCastingEquivalents:
             Series([2, 3, 4, 5, 6, 7, 8, 9, 10]),
             Series([np.nan, 3, np.nan, 5, np.nan, 7, np.nan, 9, np.nan]),
             slice(None, None, 2),
-            None,
+            False,
             id="int_series_slice_key_step",
         ),
         pytest.param(
             Series([True, True, False, False]),
             Series([np.nan, True, np.nan, False], dtype=object),
             slice(None, None, 2),
-            FutureWarning,
+            True,
             id="bool_series_slice_key_step",
         ),
         pytest.param(
@@ -919,7 +931,7 @@ class SetitemCastingEquivalents:
             Series(np.arange(10)),
             Series([np.nan, np.nan, np.nan, np.nan, np.nan, 5, 6, 7, 8, 9]),
             slice(None, 5),
-            None,
+            False,
             id="int_series_slice_key",
         ),
         pytest.param(
@@ -927,7 +939,7 @@ class SetitemCastingEquivalents:
             Series([1, 2, 3]),
             Series([np.nan, 2, 3]),
             0,
-            None,
+            False,
             id="int_series_int_key",
         ),
         pytest.param(
@@ -936,7 +948,7 @@ class SetitemCastingEquivalents:
             Series([np.nan], dtype=object),
             # TODO: maybe go to float64 since we are changing the _whole_ Series?
             0,
-            FutureWarning,
+            True,
             id="bool_series_int_key_change_all",
         ),
         pytest.param(
@@ -944,7 +956,7 @@ class SetitemCastingEquivalents:
             Series([False, True]),
             Series([np.nan, True], dtype=object),
             0,
-            FutureWarning,
+            True,
             id="bool_series_int_key",
         ),
     ],
@@ -994,8 +1006,8 @@ class TestSetitemTimedelta64IntoNumeric(SetitemCastingEquivalents):
         return 0
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 class TestSetitemDT64IntoInt(SetitemCastingEquivalents):
@@ -1034,8 +1046,8 @@ class TestSetitemDT64IntoInt(SetitemCastingEquivalents):
         return box([scalar, scalar])
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 class TestSetitemNAPeriodDtype(SetitemCastingEquivalents):
@@ -1061,8 +1073,8 @@ class TestSetitemNAPeriodDtype(SetitemCastingEquivalents):
         return request.param
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 class TestSetitemNADatetimeLikeDtype(SetitemCastingEquivalents):
@@ -1106,7 +1118,7 @@ class TestSetitemNADatetimeLikeDtype(SetitemCastingEquivalents):
     @pytest.fixture
     def expected(self, obj, val, is_inplace):
         dtype = obj.dtype if is_inplace else object
-        expected = Series([val] + list(obj[1:]), dtype=dtype)
+        expected = Series([val, *list(obj[1:])], dtype=dtype)
         return expected
 
     @pytest.fixture
@@ -1114,8 +1126,8 @@ class TestSetitemNADatetimeLikeDtype(SetitemCastingEquivalents):
         return 0
 
     @pytest.fixture
-    def warn(self, is_inplace):
-        return None if is_inplace else FutureWarning
+    def raises(self, is_inplace):
+        return False if is_inplace else True
 
 
 class TestSetitemMismatchedTZCastsToObject(SetitemCastingEquivalents):
@@ -1146,24 +1158,23 @@ class TestSetitemMismatchedTZCastsToObject(SetitemCastingEquivalents):
         return expected
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
-    "obj,expected,warn",
+    "obj,expected",
     [
         # For numeric series, we should coerce to NaN.
-        (Series([1, 2, 3]), Series([np.nan, 2, 3]), None),
-        (Series([1.0, 2.0, 3.0]), Series([np.nan, 2.0, 3.0]), None),
+        (Series([1, 2, 3]), Series([np.nan, 2, 3])),
+        (Series([1.0, 2.0, 3.0]), Series([np.nan, 2.0, 3.0])),
         # For datetime series, we should coerce to NaT.
         (
             Series([datetime(2000, 1, 1), datetime(2000, 1, 2), datetime(2000, 1, 3)]),
             Series([NaT, datetime(2000, 1, 2), datetime(2000, 1, 3)]),
-            None,
         ),
         # For objects, we should preserve the None value.
-        (Series(["foo", "bar", "baz"]), Series([None, "bar", "baz"]), None),
+        (Series(["foo", "bar", "baz"]), Series([None, "bar", "baz"])),
     ],
 )
 class TestSeriesNoneCoercion(SetitemCastingEquivalents):
@@ -1175,6 +1186,10 @@ class TestSeriesNoneCoercion(SetitemCastingEquivalents):
     def val(self):
         return None
 
+    @pytest.fixture
+    def raises(self):
+        return False
+
 
 class TestSetitemFloatIntervalWithIntIntervalValues(SetitemCastingEquivalents):
     # GH#44201 Cast to shared IntervalDtype rather than object
@@ -1185,34 +1200,46 @@ class TestSetitemFloatIntervalWithIntIntervalValues(SetitemCastingEquivalents):
         obj = Series(idx)
         val = Interval(0.5, 1.5)
 
-        with tm.assert_produces_warning(
-            FutureWarning, match="Setting an item of incompatible dtype"
-        ):
+        with pytest.raises(TypeError, match="Invalid value"):
             obj[0] = val
-        assert obj.dtype == "Interval[float64, right]"
 
     @pytest.fixture
     def obj(self):
+        """
+        Fixture to create a Series [(0, 1], (1, 2], (2, 3]]
+        """
         idx = IntervalIndex.from_breaks(range(4))
         return Series(idx)
 
     @pytest.fixture
     def val(self):
+        """
+        Fixture to get an interval (0.5, 1.5]
+        """
         return Interval(0.5, 1.5)
 
     @pytest.fixture
     def key(self):
+        """
+        Fixture to get a key 0
+        """
         return 0
 
     @pytest.fixture
     def expected(self, obj, val):
-        data = [val] + list(obj[1:])
+        """
+        Fixture to get a Series [(0.5, 1.5], (1.0, 2.0], (2.0, 3.0]]
+        """
+        data = [val, *list(obj[1:])]
         idx = IntervalIndex(data, dtype="Interval[float64]")
         return Series(idx)
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        """
+        Fixture to enable raising pytest exceptions
+        """
+        return True
 
 
 class TestSetitemRangeIntoIntegerSeries(SetitemCastingEquivalents):
@@ -1240,18 +1267,18 @@ class TestSetitemRangeIntoIntegerSeries(SetitemCastingEquivalents):
         return exp
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
-    "val, warn",
+    "val, raises",
     [
-        (np.array([2.0, 3.0]), None),
-        (np.array([2.5, 3.5]), FutureWarning),
+        (np.array([2.0, 3.0]), False),
+        (np.array([2.5, 3.5]), True),
         (
             np.array([2**65, 2**65 + 1], dtype=np.float64),
-            FutureWarning,
+            True,
         ),  # all ints, but can't cast
     ],
 )
@@ -1291,8 +1318,8 @@ class TestSetitemIntoIntegerSeriesNeedsUpcast(SetitemCastingEquivalents):
         return Series([1, 512, 3], dtype=np.int16)
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 @pytest.mark.parametrize("val", [2**33 + 1.0, 2**33 + 1.1, 2**62])
@@ -1315,8 +1342,8 @@ class TestSmallIntegerSetitemUpcast(SetitemCastingEquivalents):
         return Series([val, 2, 3], dtype=dtype)
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 class CoercionTest(SetitemCastingEquivalents):
@@ -1334,8 +1361,8 @@ class CoercionTest(SetitemCastingEquivalents):
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
-    [(np.int32(1), np.int8, None), (np.int16(2**9), np.int16, FutureWarning)],
+    "val,exp_dtype,raises",
+    [(np.int32(1), np.int8, None), (np.int16(2**9), np.int16, True)],
 )
 class TestCoercionInt8(CoercionTest):
     # previously test_setitem_series_int8 in tests.indexing.test_coercion
@@ -1353,17 +1380,30 @@ class TestCoercionObject(CoercionTest):
         return Series(["a", "b", "c", "d"], dtype=object)
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (1, np.complex128, None),
-        (1.1, np.complex128, None),
-        (1 + 1j, np.complex128, None),
-        (True, object, FutureWarning),
+        (1, object, True),
+        ("e", StringDtype(na_value=np.nan), False),
+    ],
+)
+class TestCoercionString(CoercionTest):
+    @pytest.fixture
+    def obj(self):
+        return Series(["a", "b", "c", "d"], dtype=StringDtype(na_value=np.nan))
+
+
+@pytest.mark.parametrize(
+    "val,exp_dtype,raises",
+    [
+        (1, np.complex128, False),
+        (1.1, np.complex128, False),
+        (1 + 1j, np.complex128, False),
+        (True, object, True),
     ],
 )
 class TestCoercionComplex(CoercionTest):
@@ -1374,14 +1414,14 @@ class TestCoercionComplex(CoercionTest):
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (1, object, FutureWarning),
-        ("3", object, FutureWarning),
-        (3, object, FutureWarning),
-        (1.1, object, FutureWarning),
-        (1 + 1j, object, FutureWarning),
-        (True, bool, None),
+        (1, object, True),
+        ("3", object, True),
+        (3, object, True),
+        (1.1, object, True),
+        (1 + 1j, object, True),
+        (True, bool, False),
     ],
 )
 class TestCoercionBool(CoercionTest):
@@ -1392,12 +1432,12 @@ class TestCoercionBool(CoercionTest):
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (1, np.int64, None),
-        (1.1, np.float64, FutureWarning),
-        (1 + 1j, np.complex128, FutureWarning),
-        (True, object, FutureWarning),
+        (1, np.int64, False),
+        (1.1, np.float64, True),
+        (1 + 1j, np.complex128, True),
+        (True, object, True),
     ],
 )
 class TestCoercionInt64(CoercionTest):
@@ -1408,12 +1448,12 @@ class TestCoercionInt64(CoercionTest):
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (1, np.float64, None),
-        (1.1, np.float64, None),
-        (1 + 1j, np.complex128, FutureWarning),
-        (True, object, FutureWarning),
+        (1, np.float64, False),
+        (1.1, np.float64, False),
+        (1 + 1j, np.complex128, True),
+        (True, object, True),
     ],
 )
 class TestCoercionFloat64(CoercionTest):
@@ -1424,45 +1464,26 @@ class TestCoercionFloat64(CoercionTest):
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (1, np.float32, None),
-        pytest.param(
-            1.1,
-            np.float32,
-            None,
-            marks=pytest.mark.xfail(
-                (
-                    not np_version_gte1p24
-                    or (np_version_gte1p24 and np._get_promotion_state() != "weak")
-                ),
-                reason="np.float32(1.1) ends up as 1.100000023841858, so "
-                "np_can_hold_element raises and we cast to float64",
-            ),
-        ),
-        (1 + 1j, np.complex128, FutureWarning),
-        (True, object, FutureWarning),
-        (np.uint8(2), np.float32, None),
-        (np.uint32(2), np.float32, None),
+        (1, np.float32, False),
+        (1.1, np.float32, False),
+        (1 + 1j, np.complex128, True),
+        (True, object, True),
+        (np.uint8(2), np.float32, False),
+        (np.uint32(2), np.float32, False),
         # float32 cannot hold np.iinfo(np.uint32).max exactly
         # (closest it can hold is 4294967300.0 which off by 5.0), so
         # we cast to float64
-        (np.uint32(np.iinfo(np.uint32).max), np.float64, FutureWarning),
-        (np.uint64(2), np.float32, None),
-        (np.int64(2), np.float32, None),
+        (np.uint32(np.iinfo(np.uint32).max), np.float64, True),
+        (np.uint64(2), np.float32, False),
+        (np.int64(2), np.float32, False),
     ],
 )
 class TestCoercionFloat32(CoercionTest):
     @pytest.fixture
     def obj(self):
         return Series([1.1, 2.2, 3.3, 4.4], dtype=np.float32)
-
-    def test_slice_key(self, obj, key, expected, warn, val, indexer_sli, is_inplace):
-        super().test_slice_key(obj, key, expected, warn, val, indexer_sli, is_inplace)
-
-        if isinstance(val, float):
-            # the xfail would xpass bc test_slice_key short-circuits
-            raise AssertionError("xfail not relevant for this test.")
 
 
 @pytest.mark.parametrize(
@@ -1478,7 +1499,7 @@ class TestCoercionDatetime64HigherReso(CoercionTest):
     def obj(self, exp_dtype):
         idx = date_range("2011-01-01", freq="D", periods=4, unit="s")
         if exp_dtype == "m8[ms]":
-            idx = idx - Timestamp("1970-01-01")
+            idx = idx - Timestamp("1970-01-01").as_unit("s")
             assert idx.dtype == "m8[s]"
         elif exp_dtype == "M8[ms, UTC]":
             idx = idx.tz_localize("UTC")
@@ -1488,22 +1509,22 @@ class TestCoercionDatetime64HigherReso(CoercionTest):
     def val(self, exp_dtype):
         ts = Timestamp("2011-01-02 03:04:05.678").as_unit("ms")
         if exp_dtype == "m8[ms]":
-            return ts - Timestamp("1970-01-01")
+            return ts - Timestamp("1970-01-01").as_unit("s")
         elif exp_dtype == "M8[ms, UTC]":
             return ts.tz_localize("UTC")
         return ts
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (Timestamp("2012-01-01"), "datetime64[ns]", None),
-        (1, object, FutureWarning),
-        ("x", object, FutureWarning),
+        (Timestamp("2012-01-01"), "datetime64[ns]", False),
+        (1, object, True),
+        ("x", object, True),
     ],
 )
 class TestCoercionDatetime64(CoercionTest):
@@ -1511,21 +1532,21 @@ class TestCoercionDatetime64(CoercionTest):
 
     @pytest.fixture
     def obj(self):
-        return Series(date_range("2011-01-01", freq="D", periods=4))
+        return Series(date_range("2011-01-01", freq="D", periods=4, unit="ns"))
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (Timestamp("2012-01-01", tz="US/Eastern"), "datetime64[ns, US/Eastern]", None),
+        (Timestamp("2012-01-01", tz="US/Eastern"), "datetime64[ns, US/Eastern]", False),
         # pre-2.0, a mis-matched tz would end up casting to object
-        (Timestamp("2012-01-01", tz="US/Pacific"), "datetime64[ns, US/Eastern]", None),
-        (Timestamp("2012-01-01"), object, FutureWarning),
-        (1, object, FutureWarning),
+        (Timestamp("2012-01-01", tz="US/Pacific"), "datetime64[ns, US/Eastern]", False),
+        (Timestamp("2012-01-01"), object, True),
+        (1, object, True),
     ],
 )
 class TestCoercionDatetime64TZ(CoercionTest):
@@ -1533,19 +1554,19 @@ class TestCoercionDatetime64TZ(CoercionTest):
     @pytest.fixture
     def obj(self):
         tz = "US/Eastern"
-        return Series(date_range("2011-01-01", freq="D", periods=4, tz=tz))
+        return Series(date_range("2011-01-01", freq="D", periods=4, tz=tz, unit="ns"))
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
-    "val,exp_dtype,warn",
+    "val,exp_dtype,raises",
     [
-        (Timedelta("12 day"), "timedelta64[ns]", None),
-        (1, object, FutureWarning),
-        ("x", object, FutureWarning),
+        (Timedelta("12 day"), "timedelta64[us]", False),
+        (1, object, True),
+        ("x", object, True),
     ],
 )
 class TestCoercionTimedelta64(CoercionTest):
@@ -1555,8 +1576,8 @@ class TestCoercionTimedelta64(CoercionTest):
         return Series(timedelta_range("1 day", periods=4))
 
     @pytest.fixture
-    def warn(self):
-        return None
+    def raises(self):
+        return False
 
 
 @pytest.mark.parametrize(
@@ -1575,63 +1596,45 @@ class TestPeriodIntervalCoercion(CoercionTest):
         return Series(request.param)
 
     @pytest.fixture
-    def warn(self):
-        return FutureWarning
+    def raises(self):
+        return True
 
 
 def test_20643():
     # closed by GH#45121
     orig = Series([0, 1, 2], index=["a", "b", "c"])
 
-    expected = Series([0, 2.7, 2], index=["a", "b", "c"])
-
     ser = orig.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.at["b"] = 2.7
-    tm.assert_series_equal(ser, expected)
 
-    ser = orig.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.loc["b"] = 2.7
-    tm.assert_series_equal(ser, expected)
 
-    ser = orig.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser["b"] = 2.7
-    tm.assert_series_equal(ser, expected)
 
     ser = orig.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.iat[1] = 2.7
-    tm.assert_series_equal(ser, expected)
 
-    ser = orig.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.iloc[1] = 2.7
-    tm.assert_series_equal(ser, expected)
 
     orig_df = orig.to_frame("A")
-    expected_df = expected.to_frame("A")
 
     df = orig_df.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         df.at["b", "A"] = 2.7
-    tm.assert_frame_equal(df, expected_df)
 
-    df = orig_df.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         df.loc["b", "A"] = 2.7
-    tm.assert_frame_equal(df, expected_df)
 
-    df = orig_df.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         df.iloc[1, 0] = 2.7
-    tm.assert_frame_equal(df, expected_df)
 
-    df = orig_df.copy()
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         df.iat[1, 0] = 2.7
-    tm.assert_frame_equal(df, expected_df)
 
 
 def test_20643_comment():
@@ -1653,35 +1656,23 @@ def test_15413():
     # fixed by GH#45121
     ser = Series([1, 2, 3])
 
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser[ser == 2] += 0.5
-    expected = Series([1, 2.5, 3])
-    tm.assert_series_equal(ser, expected)
 
-    ser = Series([1, 2, 3])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser[1] += 0.5
-    tm.assert_series_equal(ser, expected)
 
-    ser = Series([1, 2, 3])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.loc[1] += 0.5
-    tm.assert_series_equal(ser, expected)
 
-    ser = Series([1, 2, 3])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.iloc[1] += 0.5
-    tm.assert_series_equal(ser, expected)
 
-    ser = Series([1, 2, 3])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.iat[1] += 0.5
-    tm.assert_series_equal(ser, expected)
 
-    ser = Series([1, 2, 3])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser.at[1] += 0.5
-    tm.assert_series_equal(ser, expected)
 
 
 def test_32878_int_itemsize():
@@ -1689,10 +1680,8 @@ def test_32878_int_itemsize():
     arr = np.arange(5).astype("i4")
     ser = Series(arr)
     val = np.int64(np.iinfo(np.int64).max)
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser[0] = val
-    expected = Series([val, 1, 2, 3, 4], dtype=np.int64)
-    tm.assert_series_equal(ser, expected)
 
 
 def test_32878_complex_itemsize():
@@ -1702,20 +1691,15 @@ def test_32878_complex_itemsize():
     val = val.astype("c16")
 
     # GH#32878 used to coerce val to inf+0.000000e+00j
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         ser[0] = val
-    assert ser[0] == val
-    expected = Series([val, 1, 2, 3, 4], dtype="c16")
-    tm.assert_series_equal(ser, expected)
 
 
 def test_37692(indexer_al):
     # GH#37692
     ser = Series([1, 2, 3], index=["a", "b", "c"])
-    with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+    with pytest.raises(TypeError, match="Invalid value"):
         indexer_al(ser)["b"] = "test"
-    expected = Series([1, "test", 3], index=["a", "b", "c"], dtype=object)
-    tm.assert_series_equal(ser, expected)
 
 
 def test_setitem_bool_int_float_consistency(indexer_sli):
@@ -1725,14 +1709,12 @@ def test_setitem_bool_int_float_consistency(indexer_sli):
     #  as the setitem can be done losslessly
     for dtype in [np.float64, np.int64]:
         ser = Series(0, index=range(3), dtype=dtype)
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        with pytest.raises(TypeError, match="Invalid value"):
             indexer_sli(ser)[0] = True
-        assert ser.dtype == object
 
         ser = Series(0, index=range(3), dtype=bool)
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
+        with pytest.raises(TypeError, match="Invalid value"):
             ser[0] = dtype(1)
-        assert ser.dtype == object
 
     # 1.0 can be held losslessly, so no casting
     ser = Series(0, index=range(3), dtype=np.int64)
@@ -1751,7 +1733,8 @@ def test_setitem_positional_with_casting():
     #  setitem-with-expansion
     ser = Series([1, 2, 3], index=["a", "b", "c"])
 
-    ser[0] = "X"
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser[0] = "X"
     expected = Series([1, 2, 3, "X"], index=["a", "b", "c", 0], dtype=object)
     tm.assert_series_equal(ser, expected)
 
@@ -1763,7 +1746,8 @@ def test_setitem_positional_float_into_int_coerces():
     #  setitem-with-expansion
     ser = Series([1, 2, 3], index=["a", "b", "c"])
 
-    ser[0] = 1.5
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser[0] = 1.5
     expected = Series([1, 2, 3, 1.5], index=["a", "b", "c", 0])
     tm.assert_series_equal(ser, expected)
 
@@ -1796,9 +1780,12 @@ def test_setitem_int_not_positional():
     mi = MultiIndex.from_product([ser.index, ["A", "B"]])
     ser3 = Series(range(len(mi)), index=mi)
     expected3 = ser3.copy()
-    expected3.loc[4] = 99
+    msg = "Setting a new value on a Series with a MultiIndex"
+    with tm.assert_produces_warning(Pandas4Warning, match=msg):
+        expected3.loc[4] = 99
     # pre-enforcement `ser3[4] = 99` interpreted 4 as positional
-    ser3[4] = 99
+    with tm.assert_produces_warning(Pandas4Warning, match=msg):
+        ser3[4] = 99
     tm.assert_series_equal(ser3, expected3)
 
 
@@ -1865,3 +1852,213 @@ def test_setitem_empty_mask_dont_upcast_dt64():
     ser.mask(mask, "foo", inplace=True)
     assert ser.dtype == dti.dtype  # no-op -> dont upcast
     tm.assert_series_equal(ser, orig)
+
+
+def test_setitem_bool_dtype_with_boolean_indexer():
+    # GH 57338
+    s1 = Series([True, True, True], dtype=bool)
+    s2 = Series([False, False, False], dtype=bool)
+    condition = [False, True, False]
+    s1[condition] = s2[condition]
+    expected = Series([True, False, True], dtype=bool)
+    tm.assert_series_equal(s1, expected)
+
+
+@pytest.mark.parametrize(
+    "value, expected_dtype",
+    [
+        ("foo", object),
+        (3.5, np.float64),
+        (Timestamp("2025-01-01"), object),
+    ],
+)
+def test_setitem_expansion_incompatible_dtype_warns(value, expected_dtype):
+    # GH#62369 silent dtype change during setitem-with-expansion
+    ser = Series([1, 2], dtype=np.int64)
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = value
+    assert ser.dtype == expected_dtype
+
+
+@pytest.mark.parametrize(
+    "value, expected_dtype",
+    [
+        # compatible value, dtype unchanged
+        (3, np.int64),
+        # float losslessly downcast back to int64
+        (3.0, np.int64),
+        # PDEP-6 exception: int -> float when the value introduces NaN
+        (np.nan, np.float64),
+    ],
+)
+def test_setitem_expansion_compatible_dtype_no_warning(value, expected_dtype):
+    # GH#62369
+    ser = Series([1, 2], dtype=np.int64)
+    with tm.assert_produces_warning(None):
+        ser.loc[2] = value
+    assert ser.dtype == expected_dtype
+
+
+def test_setitem_expansion_float64_holds_int_no_warning():
+    # GH#62369 float64 can hold an int value losslessly, dtype is retained
+    ser = Series([1.5, 2.5])
+    with tm.assert_produces_warning(None):
+        ser.loc[2] = 3
+    assert ser.dtype == np.float64
+
+
+def test_setitem_expansion_complex_into_float_warns():
+    # GH#62369 complex is numeric but float64 cannot hold it losslessly,
+    #  so the dtype changes (with a warning) and the value is preserved
+    ser = Series([1.0, 2.0])
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = 1 + 2j
+    expected = Series([1.0, 2.0, 1 + 2j], dtype=np.complex128)
+    tm.assert_series_equal(ser, expected)
+
+
+def test_setitem_expansion_float64_value_into_float32_warns():
+    # GH#62369 value does not fit in float32, so the dtype changes
+    #  (with a warning) and the value is preserved
+    ser = Series([1.0, 2.0], dtype=np.float32)
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = 1e300
+    expected = Series([1.0, 2.0, 1e300], dtype=np.float64)
+    tm.assert_series_equal(ser, expected)
+
+
+@pytest.mark.parametrize("dtype", ["Int64", "Float64", "boolean"])
+def test_setitem_expansion_incompatible_masked_dtype_warns(dtype):
+    # GH#62369 extension dtypes participate in the expansion deprecation
+    ser = Series([1, 0], dtype=dtype)
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = "foo"
+    assert ser.dtype == object
+
+
+def test_setitem_expansion_masked_lossy_float_warns():
+    # GH#62369 2.5 cannot be held losslessly by Int64
+    ser = Series([1, 2], dtype="Int64")
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = 2.5
+    assert ser.dtype == "Float64"
+
+
+def test_setitem_expansion_masked_compatible_no_warning():
+    # GH#62369 NA and lossless floats can be held by Int64; dtype is retained
+    ser = Series([1, 2], dtype="Int64")
+    with tm.assert_produces_warning(None):
+        ser.loc[2] = NA
+        ser.loc[3] = 4.0
+    assert ser.dtype == "Int64"
+
+
+def test_setitem_expansion_categorical_novel_value_warns():
+    # GH#62369 a value outside the categories changes the dtype
+    ser = Series(Categorical(["a", "b"]))
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = "zzz"
+    assert ser.dtype != "category"
+
+
+def test_setitem_expansion_categorical_known_value_no_warning():
+    # GH#62369 a value among the categories is compatible
+    ser = Series(Categorical(["a", "b"]))
+    with tm.assert_produces_warning(None):
+        ser.loc[2] = "a"
+    assert ser.dtype == "category"
+
+
+def test_setitem_expansion_arrow_incompatible_warns():
+    # GH#62369
+    pytest.importorskip("pyarrow")
+    ser = Series([1, 2], dtype="int64[pyarrow]")
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = "foo"
+    assert ser.dtype == object
+
+
+@pytest.mark.parametrize("value", [2**63, np.inf, -np.inf])
+def test_setitem_enlarge_out_of_int64_range(value):
+    # GH#66394 the result must not be downcast back to int64; on aarch64 the
+    #  out-of-range cast saturated and 2**63 was silently stored as 2**63 - 1
+    ser = Series([1, 2], dtype="int64")
+
+    # GH#62369 int64 cannot hold the value, so the widening is deprecated
+    with tm.assert_produces_warning(
+        Pandas4Warning, match="incompatible dtype"
+    ) as record:
+        ser.loc[2] = value
+    assert not any(issubclass(warning.category, RuntimeWarning) for warning in record)
+
+    expected = Series([1.0, 2.0, value], dtype="float64")
+    tm.assert_series_equal(ser, expected)
+
+
+def test_setitem_enlarge_within_int64_range():
+    # GH#66394 in-range values still downcast back to int64
+    ser = Series([1, 2], dtype="int64")
+    ser.loc[2] = 2**62
+
+    expected = Series([1, 2, 2**62], dtype="int64")
+    tm.assert_series_equal(ser, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype, expected_dtype",
+    [
+        ("Int64", "Float64"),
+        ("UInt64", "Float64"),
+        ("int64[pyarrow]", "double[pyarrow]"),
+        ("uint64[pyarrow]", "double[pyarrow]"),
+    ],
+)
+def test_setitem_enlarge_out_of_int_ea_range(dtype, expected_dtype):
+    # GH#65094 the out-of-range float->int cast saturates instead of raising,
+    #  and the roundtrip check could not see it, since e.g. 2**63 and 2**63 - 1
+    #  are the same float64, so the value was silently stored as the dtype max
+    if "pyarrow" in dtype:
+        pytest.importorskip("pyarrow")
+    value = 2.0**64 if dtype.lower().startswith("uint") else 2.0**63
+    ser = Series([1, 2], dtype=dtype)
+
+    with tm.assert_produces_warning(Pandas4Warning, match="incompatible dtype"):
+        ser.loc[2] = value
+
+    expected = Series([1.0, 2.0, value], dtype=expected_dtype)
+    tm.assert_series_equal(ser, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype, value", [("Sparse[int64]", 2.0**63), ("Sparse[uint64]", 2.0**64)]
+)
+def test_setitem_enlarge_out_of_sparse_int_range(dtype, value):
+    # GH#65094 SparseDtype reaches the same cast, but spells its backing numpy
+    #  dtype `subtype`, so it was skipping the range check and storing the
+    #  saturated value
+    ser = Series([1, 2], dtype=dtype)
+
+    with tm.assert_produces_warning(
+        Pandas4Warning, match="incompatible dtype", raise_on_extra_warnings=False
+    ):
+        ser.loc[2] = value
+
+    expected = Series([1.0, 2.0, value], dtype="Sparse[float64]")
+    tm.assert_series_equal(ser, expected)
+
+
+@pytest.mark.parametrize("dtype", ["Int64", "int64[pyarrow]", "Sparse[int64]"])
+def test_setitem_enlarge_int_ea_above_2_53(dtype):
+    # GH#65094 an in-range integral float above 2**53 is exact, so the dtype is
+    #  retained.  For ArrowDtype the check used to roundtrip through pyarrow,
+    #  whose int64->double cast rejects anything above 2**53, raising
+    #  ArrowInvalid out of .loc
+    if "pyarrow" in dtype:
+        pytest.importorskip("pyarrow")
+    ser = Series([1, 2], dtype=dtype)
+
+    with tm.assert_produces_warning(None):
+        ser.loc[2] = 1.7e18
+
+    expected = Series([1, 2, 1700000000000000000], dtype=dtype)
+    tm.assert_series_equal(ser, expected)

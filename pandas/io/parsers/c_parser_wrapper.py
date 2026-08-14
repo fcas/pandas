@@ -21,6 +21,9 @@ from pandas.core.dtypes.concat import (
 )
 from pandas.core.dtypes.dtypes import CategoricalDtype
 
+from pandas.core.arrays.arrow.array import ArrowExtensionArray
+from pandas.core.arrays.string_ import StringDtype
+from pandas.core.arrays.string_arrow import ArrowStringArray
 from pandas.core.indexes.api import ensure_index_from_sequences
 
 from pandas.io.common import (
@@ -30,7 +33,10 @@ from pandas.io.common import (
 from pandas.io.parsers.base_parser import (
     ParserBase,
     ParserError,
+    date_converter,
+    evaluate_callable_usecols,
     is_index_col,
+    validate_parse_dates_presence,
 )
 
 if TYPE_CHECKING:
@@ -58,6 +64,11 @@ if TYPE_CHECKING:
 class CParserWrapper(ParserBase):
     low_memory: bool
     _reader: parsers.TextReader
+    _exhausted: bool
+    # When False, read() leaves deferred string columns as raw pending
+    # handles for the caller to materialize (one chunked ExtensionArray per
+    # column, e.g. post-gather in a parallel read).
+    wrap_deferred: bool = True
 
     def __init__(self, src: ReadCsvBuffer[str], **kwds) -> None:
         super().__init__(kwds)
@@ -65,12 +76,10 @@ class CParserWrapper(ParserBase):
         kwds = kwds.copy()
 
         self.low_memory = kwds.pop("low_memory", False)
+        self._exhausted = False
 
         # #2442
-        # error: Cannot determine type of 'index_col'
-        kwds["allow_leading_cols"] = (
-            self.index_col is not False  # type: ignore[has-type]
-        )
+        kwds["allow_leading_cols"] = self.index_col is not False
 
         # GH20529, validate usecol arg before TextReader
         kwds["usecols"] = self.usecols
@@ -93,30 +102,29 @@ class CParserWrapper(ParserBase):
             # Fail here loudly instead of in cython after reading
             import_optional_dependency("pyarrow")
         self._reader = parsers.TextReader(src, **kwds)
+        # Let the pyarrow string fast path return raw pending-column handles;
+        # read() wraps them into one ExtensionArray per column at the end.
+        self._reader.defer_pa_wrap = True
 
         self.unnamed_cols = self._reader.unnamed_cols
 
-        # error: Cannot determine type of 'names'
-        passed_names = self.names is None  # type: ignore[has-type]
+        passed_names = self.names is None
 
         if self._reader.header is None:
             self.names = None
         else:
-            # error: Cannot determine type of 'names'
-            # error: Cannot determine type of 'index_names'
             (
-                self.names,  # type: ignore[has-type]
+                self.names,
                 self.index_names,
                 self.col_names,
                 passed_names,
             ) = self._extract_multi_indexer_columns(
                 self._reader.header,
-                self.index_names,  # type: ignore[has-type]
+                self.index_names,
                 passed_names,
             )
 
-        # error: Cannot determine type of 'names'
-        if self.names is None:  # type: ignore[has-type]
+        if self.names is None:
             self.names = list(range(self._reader.table_width))
 
         # gh-9755
@@ -127,11 +135,10 @@ class CParserWrapper(ParserBase):
         #
         # once names has been filtered, we will
         # then set orig_names again to names
-        # error: Cannot determine type of 'names'
-        self.orig_names = self.names[:]  # type: ignore[has-type]
+        self.orig_names = self.names[:]
 
         if self.usecols:
-            usecols = self._evaluate_usecols(self.usecols, self.orig_names)
+            usecols = evaluate_callable_usecols(self.usecols, self.orig_names)
 
             # GH 14671
             # assert for mypy, orig_names is List or None, None would error in issubset
@@ -141,45 +148,32 @@ class CParserWrapper(ParserBase):
             ):
                 self._validate_usecols_names(usecols, self.orig_names)
 
-            # error: Cannot determine type of 'names'
-            if len(self.names) > len(usecols):  # type: ignore[has-type]
-                # error: Cannot determine type of 'names'
-                self.names = [  # type: ignore[has-type]
+            if len(self.names) > len(usecols):
+                self.names = [
                     n
-                    # error: Cannot determine type of 'names'
-                    for i, n in enumerate(self.names)  # type: ignore[has-type]
+                    for i, n in enumerate(self.names)
                     if (i in usecols or n in usecols)
                 ]
 
-            # error: Cannot determine type of 'names'
-            if len(self.names) < len(usecols):  # type: ignore[has-type]
-                # error: Cannot determine type of 'names'
+            if len(self.names) < len(usecols):
                 self._validate_usecols_names(
                     usecols,
-                    self.names,  # type: ignore[has-type]
+                    self.names,
                 )
 
-        # error: Cannot determine type of 'names'
-        self._validate_parse_dates_presence(self.names)  # type: ignore[has-type]
+        validate_parse_dates_presence(self.parse_dates, self.names)
         self._set_noconvert_columns()
 
-        # error: Cannot determine type of 'names'
-        self.orig_names = self.names  # type: ignore[has-type]
+        self.orig_names = self.names
 
-        # error: Cannot determine type of 'index_col'
-        if self._reader.leading_cols == 0 and is_index_col(
-            self.index_col  # type: ignore[has-type]
-        ):
+        if self._reader.leading_cols == 0 and is_index_col(self.index_col):
             (
                 index_names,
-                # error: Cannot determine type of 'names'
-                self.names,  # type: ignore[has-type]
+                self.names,
                 self.index_col,
             ) = self._clean_index_names(
-                # error: Cannot determine type of 'names'
-                self.names,  # type: ignore[has-type]
-                # error: Cannot determine type of 'index_col'
-                self.index_col,  # type: ignore[has-type]
+                self.names,
+                self.index_col,
             )
 
             if self.index_names is None:
@@ -209,15 +203,54 @@ class CParserWrapper(ParserBase):
         # error: Cannot determine type of 'names'
 
         # much faster than using orig_names.index(x) xref GH#44106
-        names_dict = {x: i for i, x in enumerate(self.orig_names)}
-        col_indices = [names_dict[x] for x in self.names]  # type: ignore[has-type]
-        # error: Cannot determine type of 'names'
+        names_dict = {x: i for i, x in enumerate(self.orig_names)}  # pyright: ignore[reportOptionalIterable]
+        col_indices = [names_dict[x] for x in self.names]  # pyright: ignore[reportOptionalIterable]
         noconvert_columns = self._set_noconvert_dtype_columns(
             col_indices,
-            self.names,  # type: ignore[has-type]
+            self.names,
         )
         for col in noconvert_columns:
             self._reader.set_noconvert(col)
+
+        # Mark parse_dates columns so the C parser can try to emit datetime64
+        # directly, skipping the Python-str ndarray round-trip. In low_memory
+        # mode the C parser keeps raw-byte receipts per chunk so a fallback in
+        # any chunk restores the whole column to the object-string path.
+        # With a list parse_dates, noconvert_columns is exactly the resolved
+        # parse_dates targets (integer colspecs usecols-relative, matching
+        # _do_date_conversions).
+        # Not with implicit-index files (leading_cols > 0): noconvert indices
+        # are not shifted by leading_cols, so the fastpath gate in
+        # _convert_tokens cannot line up with them.
+        if isinstance(self.parse_dates, list) and self._reader.leading_cols == 0:
+            for col_idx in noconvert_columns:
+                name = self.orig_names[col_idx]
+                require_consistent = self._parse_dates_fastpath_strictness(name)
+                if require_consistent is not None:
+                    self._reader.set_datetime_convert(col_idx, require_consistent)
+
+    def _parse_dates_fastpath_strictness(self, name: Hashable) -> bool | None:
+        """
+        Decide whether a parse_dates column is a candidate for the direct
+        char-buffer -> datetime64 fastpath, returning None if not, otherwise
+        whether the fastpath must require a single consistent format.
+
+        With date_format=None, to_datetime infers one format from the first
+        value and rejects rows that deviate, so the fastpath must do the same;
+        with date_format="ISO8601" mixed ISO8601 layouts are allowed.
+        """
+        if self.dayfirst:
+            return None
+        date_format = self.date_format
+        if isinstance(date_format, dict):
+            date_format = date_format.get(name)
+        if date_format is None:
+            return True
+        if date_format == "ISO8601":
+            return False
+        # If a specific format is supplied, let the existing path handle it.
+        # A future extension could detect ISO-shaped formats here.
+        return None
 
     def read(
         self,
@@ -229,17 +262,27 @@ class CParserWrapper(ParserBase):
     ]:
         index: Index | MultiIndex | None
         column_names: Sequence[Hashable] | MultiIndex
+        if self._exhausted:
+            # Exhausting the reader closed it, so calling into the C reader
+            # again would raise instead of signalling the end of the data.
+            raise StopIteration
         try:
             if self.low_memory:
                 chunks = self._reader.read_low_memory(nrows)
                 # destructive to chunks
-                data = _concatenate_chunks(chunks, self.names)  # type: ignore[has-type]
-
+                data = _concatenate_chunks(chunks, self.names)
             else:
                 data = self._reader.read(nrows)
+                if self.wrap_deferred:
+                    data = {
+                        key: _wrap_deferred_pa(values) for key, values in data.items()
+                    }
         except StopIteration:
             if self._first_chunk:
                 self._first_chunk = False
+                # assert for mypy, orig_names is List or None, None would error in
+                # list(...) in dedup_names
+                assert self.orig_names is not None
                 names = dedup_names(
                     self.orig_names,
                     is_potential_multi_index(self.orig_names, self.index_col),
@@ -254,22 +297,22 @@ class CParserWrapper(ParserBase):
                     columns, self.col_names
                 )
 
-                if self.usecols is not None:
-                    columns = self._filter_usecols(columns)
+                columns = _filter_usecols(self.usecols, columns)
+                columns_set = set(columns)
 
-                col_dict = {k: v for k, v in col_dict.items() if k in columns}
+                col_dict = {k: v for k, v in col_dict.items() if k in columns_set}
 
                 return index, columns, col_dict
 
             else:
+                self._exhausted = True
                 self.close()
                 raise
 
         # Done with first read, next time raise StopIteration
         self._first_chunk = False
 
-        # error: Cannot determine type of 'names'
-        names = self.names  # type: ignore[has-type]
+        names = self.names
 
         if self._reader.leading_cols:
             # implicit index, no index names
@@ -288,19 +331,29 @@ class CParserWrapper(ParserBase):
                 else:
                     values = data.pop(self.index_col[i])
 
-                values = self._maybe_parse_dates(values, i, try_parse_dates=True)
+                if self._should_parse_dates(i):
+                    values = date_converter(
+                        values,
+                        col=(
+                            self.index_names[i]
+                            if self.index_names is not None
+                            else None
+                        ),
+                        dayfirst=self.dayfirst,
+                        cache_dates=self.cache_dates,
+                        date_format=self.date_format,
+                    )
                 arrays.append(values)
 
             index = ensure_index_from_sequences(arrays)
 
-            if self.usecols is not None:
-                names = self._filter_usecols(names)
+            names = _filter_usecols(self.usecols, names)
 
             names = dedup_names(names, is_potential_multi_index(names, self.index_col))
 
             # rename dict keys
             data_tups = sorted(data.items())
-            data = {k: v for k, (i, v) in zip(names, data_tups)}
+            data = {k: v for k, (i, v) in zip(names, data_tups, strict=True)}
 
             date_data = self._do_date_conversions(names, data)
 
@@ -318,47 +371,68 @@ class CParserWrapper(ParserBase):
             names = list(self.orig_names)
             names = dedup_names(names, is_potential_multi_index(names, self.index_col))
 
-            if self.usecols is not None:
-                names = self._filter_usecols(names)
+            names = _filter_usecols(self.usecols, names)
 
             # columns as list
             alldata = [x[1] for x in data_tups]
             if self.usecols is None:
                 self._check_data_length(names, alldata)
 
-            data = {k: v for k, (i, v) in zip(names, data_tups)}
+            data = {k: v for k, (i, v) in zip(names, data_tups, strict=False)}
 
             date_data = self._do_date_conversions(names, data)
-            index, column_names = self._make_index(date_data, alldata, names)
+            index, column_names = self._make_index(alldata, names)
 
         return index, column_names, date_data
 
-    def _filter_usecols(self, names: SequenceT) -> SequenceT | list[Hashable]:
-        # hackish
-        usecols = self._evaluate_usecols(self.usecols, names)
-        if usecols is not None and len(names) != len(usecols):
-            return [
-                name for i, name in enumerate(names) if i in usecols or name in usecols
-            ]
-        return names
 
-    def _maybe_parse_dates(self, values, index: int, try_parse_dates: bool = True):
-        if try_parse_dates and self._should_parse_dates(index):
-            values = self._date_conv(
-                values,
-                col=self.index_names[index] if self.index_names is not None else None,
-            )
-        return values
+def _filter_usecols(usecols, names: SequenceT) -> SequenceT | list[Hashable]:
+    # hackish
+    usecols = evaluate_callable_usecols(usecols, names)
+    if usecols is not None and len(names) != len(usecols):
+        return [name for i, name in enumerate(names) if i in usecols or name in usecols]
+    return names
+
+
+def _pa_arrays_to_ea(arrs) -> ArrayLike:
+    """
+    Build one ExtensionArray from the pending string columns returned by
+    the deferred TextReader string fast path (``defer_pa_wrap``).
+
+    The fast path emits ``large_string`` for the default string dtype and
+    ``string`` for ``dtype_backend="pyarrow"``, so the arrow type determines
+    the target ExtensionArray.
+    """
+    import pyarrow as pa
+
+    chunked = pa.chunked_array([pending.materialize() for pending in arrs])
+    if pa.types.is_large_string(chunked.type):
+        return ArrowStringArray(chunked, dtype=StringDtype(na_value=np.nan))
+    return ArrowExtensionArray(chunked)
+
+
+def _wrap_deferred_pa(values):
+    """Wrap a pending string column from the deferred fast path; pass through
+    everything else."""
+    if isinstance(values, parsers._PendingStringColumn):
+        return _pa_arrays_to_ea([values])
+    return values
 
 
 def _concatenate_chunks(
-    chunks: list[dict[int, ArrayLike]], column_names: list[str]
+    chunks: list[dict[int, ArrayLike]],
+    column_names: Sequence[Hashable],
+    warn_mixed: bool = True,
 ) -> dict:
     """
     Concatenate chunks of data read with low_memory=True.
 
     The tricky part is handling Categoricals, where different chunks
     may have different inferred categories.
+
+    ``warn_mixed=False`` suppresses the mixed-dtype warning; the parallel
+    reader gathers byte-range chunks (not low_memory row chunks), so a
+    column's cross-chunk dtype has already been reconciled by the caller.
     """
     names = list(chunks[0].keys())
     warning_columns = []
@@ -366,19 +440,33 @@ def _concatenate_chunks(
     result: dict = {}
     for name in names:
         arrs = [chunk.pop(name) for chunk in chunks]
+
+        # The homogeneous case (every chunk a pending string column from the
+        # deferred fast path) combines zero-copy into a single chunked
+        # ExtensionArray; mixed cases (e.g. earlier chunks inferred numeric)
+        # wrap each pending column and fall through to the regular concat
+        # below.
+        if isinstance(arrs[0], parsers._PendingStringColumn):
+            if all(isinstance(arr, parsers._PendingStringColumn) for arr in arrs):
+                result[name] = _pa_arrays_to_ea(arrs)
+                continue
+            arrs = [_wrap_deferred_pa(arr) for arr in arrs]
+        elif any(isinstance(arr, parsers._PendingStringColumn) for arr in arrs):
+            arrs = [_wrap_deferred_pa(arr) for arr in arrs]
+
         # Check each arr for consistent types.
         dtypes = {a.dtype for a in arrs}
         non_cat_dtypes = {x for x in dtypes if not isinstance(x, CategoricalDtype)}
 
         dtype = dtypes.pop()
         if isinstance(dtype, CategoricalDtype):
-            result[name] = union_categoricals(arrs, sort_categories=False)
+            result[name] = union_categoricals(arrs, sort_categories=False)  # type: ignore[arg-type]
         else:
             result[name] = concat_compat(arrs)
             if len(non_cat_dtypes) > 1 and result[name].dtype == np.dtype(object):
                 warning_columns.append(column_names[name])
 
-    if warning_columns:
+    if warning_columns and warn_mixed:
         warning_names = ", ".join(
             [f"{index}: {name}" for index, name in enumerate(warning_columns)]
         )

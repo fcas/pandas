@@ -218,11 +218,17 @@ def test_apply_modify_traceback():
 def test_agg_cython_table_raises_frame(df, func, expected, axis, using_infer_string):
     # GH 21224
     if using_infer_string:
-        import pyarrow as pa
+        expected = (expected, NotImplementedError)
 
-        expected = (expected, pa.lib.ArrowNotImplementedError)
-
-    msg = "can't multiply sequence by non-int of type 'str'|has no kernel"
+    msg = "|".join(
+        [
+            "can't multiply sequence by non-int of type 'str'",
+            # NotImplementedError python backend
+            "cannot perform cumprod with type str",
+            # TypeError pyarrow
+            "operation 'cumprod' not supported for dtype 'str'",
+        ]
+    )
     warn = None if isinstance(func, str) else FutureWarning
     with pytest.raises(expected, match=msg):
         with tm.assert_produces_warning(warn, match="using DataFrame.cumprod"):
@@ -231,32 +237,43 @@ def test_agg_cython_table_raises_frame(df, func, expected, axis, using_infer_str
 
 @pytest.mark.parametrize(
     "series, func, expected",
-    chain(
-        tm.get_cython_table_params(
-            Series("a b c".split()),
-            [
-                ("mean", TypeError),  # mean raises TypeError
-                ("prod", TypeError),
-                ("std", TypeError),
-                ("var", TypeError),
-                ("median", TypeError),
-                ("cumprod", TypeError),
-            ],
+    list(
+        chain(
+            tm.get_cython_table_params(
+                Series("a b c".split()),
+                [
+                    ("mean", TypeError),  # mean raises TypeError
+                    ("prod", TypeError),
+                    ("std", TypeError),
+                    ("var", TypeError),
+                    ("median", TypeError),
+                    ("cumprod", TypeError),
+                ],
+            )
         )
     ),
 )
 def test_agg_cython_table_raises_series(series, func, expected, using_infer_string):
     # GH21224
-    msg = r"[Cc]ould not convert|can't multiply sequence by non-int of type"
+    msg = "|".join(
+        ["[Cc]ould not convert", "can't multiply sequence by non-int of type"]
+    )
     if func == "median" or func is np.nanmedian or func is np.median:
         msg = r"Cannot convert \['a' 'b' 'c'\] to numeric"
 
-    if using_infer_string:
-        import pyarrow as pa
+    if using_infer_string and func == "cumprod":
+        expected = (expected, NotImplementedError)
 
-        expected = (expected, pa.lib.ArrowNotImplementedError)
-
-    msg = msg + "|does not support|has no kernel"
+    msg = "|".join(
+        [
+            msg,
+            "does not support",
+            "has no kernel",
+            "Cannot perform",
+            "cannot perform",
+            "operation",
+        ]
+    )
     warn = None if isinstance(func, str) else FutureWarning
 
     with pytest.raises(expected, match=msg):
@@ -296,7 +313,7 @@ def test_apply_broadcast_error(func):
     )
 
     # > 1 ndim
-    msg = "too many dims to broadcast|cannot broadcast result"
+    msg = "|".join(["too many dims to broadcast", "cannot broadcast result"])
     with pytest.raises(ValueError, match=msg):
         df.apply(func, axis=1, result_type="broadcast")
 

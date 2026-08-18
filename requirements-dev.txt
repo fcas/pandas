@@ -56,7 +56,7 @@ asv>=0.6.6
 py-rattler
 mypy==2.1.0
 tokenize-rt
-pre-commit>=4.2.0
+pre-commit>=4.6.2
 gitpython
 natsort
 pickleshare

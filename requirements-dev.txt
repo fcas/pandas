@@ -84,5 +84,5 @@ requests
 pygments
 jupyterlite-core
 jupyterlite-pyodide-kernel
-tzdata>=2023.3
+tzdata>=2026.3
 https://github.com/jorisvandenbossche/pydata-sphinx-theme/archive/refs/heads/v0.16.1+dismissable-announcement-banner.zip
